@@ -934,6 +934,12 @@ class RODOptions(Options):
         If True, the rod twisting stiffness G is differentiable. Defaults to False.
     disable_constraint_grad: bool, optional
         If True, skip the backpropagation for constraint projection. Defaults to False.
+    two_way_attachment_forces : bool, optional
+        If True, apply bounded axial reaction forces from rod vertices attached
+        to rigid links. This experimental feature is disabled by default.
+    two_way_attachment_force_limit : float, optional
+        Per-vertex magnitude cap in newtons for the experimental two-way
+        attachment reaction. Defaults to 0.5.
     """
 
     dt: PositiveFloat | None = None
@@ -950,3 +956,4 @@ class RODOptions(Options):
     requires_grad_G: StrictBool = False
     disable_constraint_grad: StrictBool = False
     two_way_attachment_forces: StrictBool = False
+    two_way_attachment_force_limit: NonNegativeFloat = 0.5

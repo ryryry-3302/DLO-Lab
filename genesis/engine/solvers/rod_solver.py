@@ -143,6 +143,7 @@ class RODSolver(Solver):
         # LegacyCoupler can return endpoint reaction forces to a dynamic rigid
         # link. Keep this opt-in to preserve the original one-way behavior.
         self._two_way_attachment_forces = options.two_way_attachment_forces
+        self._two_way_attachment_force_limit = options.two_way_attachment_force_limit
         self._max_collision_grad_norm = 0.1
 
         # properties

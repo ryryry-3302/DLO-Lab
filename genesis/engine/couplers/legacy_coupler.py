@@ -1049,11 +1049,14 @@ class LegacyCoupler(RBC):
         for i_v, i_b in qd.ndrange(self.rod_solver._n_vertices, self.rod_solver._B):
             constraint = self.rod_solver.vertex_constraints[i_v, i_b]
             if constraint.constrained and constraint.link_idx >= 0:
-                rod_force = (
-                    self.rod_solver.vertices_force[i_v, i_b].f_s
-                    + self.rod_solver.vertices_force[i_v, i_b].f_b
-                    + self.rod_solver.vertices_force[i_v, i_b].f_t
-                )
+                # This is intentionally axial force only. Returning bending
+                # and twisting forces directly into the rigid constraint
+                # solver made the first two-way experiment numerically
+                # unstable. Limit the reaction to a safe, tunable force.
+                rod_force = self.rod_solver.vertices_force[i_v, i_b].f_s
+                magnitude = rod_force.norm(gs.EPS)
+                limit = self.rod_solver._two_way_attachment_force_limit
+                rod_force = rod_force * qd.min(1.0, limit / magnitude)
                 self.rigid_solver._func_apply_coupling_force(
                     self.rod_solver.vertices[f, i_v, i_b].vert,
                     -rod_force,
