@@ -140,6 +140,9 @@ class RODSolver(Solver):
         self._req_grad_E = options.requires_grad_E
         self._req_grad_G = options.requires_grad_G
         self._disable_constraint_grad = options.disable_constraint_grad
+        # LegacyCoupler can return endpoint reaction forces to a dynamic rigid
+        # link. Keep this opt-in to preserve the original one-way behavior.
+        self._two_way_attachment_forces = options.two_way_attachment_forces
         self._max_collision_grad_norm = 0.1
 
         # properties

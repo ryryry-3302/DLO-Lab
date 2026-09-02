@@ -1037,9 +1037,30 @@ class LegacyCoupler(RBC):
             # )
             # self.rod_solver.vertices[f + 1, i_v, i_b].vel = vel_rod_prime
 
-    def rod_rigid_link_constraints(self):
+    def rod_rigid_link_constraints(self, f):
         if self.rigid_solver.is_active:
             self.rod_solver._kernel_update_attached_verts(self.rigid_solver.links_state)
+            if self.rod_solver._two_way_attachment_forces:
+                self.rod_rigid_apply_attached_vertex_forces(f, self.rigid_solver.links_state)
+
+    @qd.kernel
+    def rod_rigid_apply_attached_vertex_forces(self, f: qd.i32, links_state: LinksState):
+        """Apply attached rod-vertex reaction forces to their rigid links."""
+        for i_v, i_b in qd.ndrange(self.rod_solver._n_vertices, self.rod_solver._B):
+            constraint = self.rod_solver.vertex_constraints[i_v, i_b]
+            if constraint.constrained and constraint.link_idx >= 0:
+                rod_force = (
+                    self.rod_solver.vertices_force[i_v, i_b].f_s
+                    + self.rod_solver.vertices_force[i_v, i_b].f_b
+                    + self.rod_solver.vertices_force[i_v, i_b].f_t
+                )
+                self.rigid_solver._func_apply_coupling_force(
+                    self.rod_solver.vertices[f, i_v, i_b].vert,
+                    -rod_force,
+                    constraint.link_idx,
+                    i_b,
+                    links_state,
+                )
 
     @qd.kernel
     def init_rod_rigid_gripper_geom_indices(self, n_geoms: qd.i32, geom_indices: qd.types.ndarray()):
@@ -1376,7 +1397,7 @@ class LegacyCoupler(RBC):
                 self.rigid_solver.collider._sdf._sdf_info,
                 self.rigid_solver.collider._collider_static_config,
             )
-            self.rod_rigid_link_constraints()
+            self.rod_rigid_link_constraints(f)
 
     def couple_grad(self, f):
         if self.fem_solver.is_active:

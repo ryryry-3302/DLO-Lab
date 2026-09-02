@@ -949,3 +949,4 @@ class RODOptions(Options):
     requires_grad_E: StrictBool = False
     requires_grad_G: StrictBool = False
     disable_constraint_grad: StrictBool = False
+    two_way_attachment_forces: StrictBool = False
