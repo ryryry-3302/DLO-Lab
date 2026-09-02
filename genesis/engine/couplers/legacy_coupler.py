@@ -1041,10 +1041,21 @@ class LegacyCoupler(RBC):
         if self.rigid_solver.is_active:
             self.rod_solver._kernel_update_attached_verts(self.rigid_solver.links_state)
             if self.rod_solver._two_way_attachment_forces:
-                self.rod_rigid_apply_attached_vertex_forces(f, self.rigid_solver.links_state)
+                self.rod_rigid_apply_attached_vertex_forces(
+                    f,
+                    self.rigid_solver.links_state,
+                    self.rigid_solver.links_info,
+                    self.rigid_solver._static_rigid_sim_config,
+                )
 
     @qd.kernel
-    def rod_rigid_apply_attached_vertex_forces(self, f: qd.i32, links_state: LinksState):
+    def rod_rigid_apply_attached_vertex_forces(
+        self,
+        f: qd.i32,
+        links_state: LinksState,
+        links_info: array_class.LinksInfo,
+        static_rigid_sim_config: qd.template(),
+    ):
         """Apply attached rod-vertex reaction forces to their rigid links."""
         for i_v, i_b in qd.ndrange(self.rod_solver._n_vertices, self.rod_solver._B):
             constraint = self.rod_solver.vertex_constraints[i_v, i_b]
@@ -1055,7 +1066,15 @@ class LegacyCoupler(RBC):
                 # unstable. Limit the reaction to a safe, tunable force.
                 rod_force = self.rod_solver.vertices_force[i_v, i_b].f_s
                 magnitude = rod_force.norm(gs.EPS)
-                limit = self.rod_solver._two_way_attachment_force_limit
+                # Two vertices are attached at each cable end. In addition to
+                # the configured force cap, bound their combined contribution
+                # to the rigid body's acceleration. Mesh-derived connector
+                # inertias can be very small, so a seemingly modest force can
+                # otherwise immediately destabilize the rigid solver.
+                I_l = [constraint.link_idx, i_b] if qd.static(static_rigid_sim_config.batch_links_info) else constraint.link_idx
+                mass = links_info.inertial_mass[I_l] + links_state.mass_shift[constraint.link_idx, i_b]
+                acceleration_limit = 0.5 * mass * self.rod_solver._two_way_attachment_max_acceleration
+                limit = qd.min(self.rod_solver._two_way_attachment_force_limit, acceleration_limit)
                 rod_force = rod_force * qd.min(1.0, limit / magnitude)
                 self.rigid_solver._func_apply_coupling_force(
                     self.rod_solver.vertices[f, i_v, i_b].vert,

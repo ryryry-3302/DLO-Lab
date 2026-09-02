@@ -940,6 +940,9 @@ class RODOptions(Options):
     two_way_attachment_force_limit : float, optional
         Per-vertex magnitude cap in newtons for the experimental two-way
         attachment reaction. Defaults to 0.5.
+    two_way_attachment_max_acceleration : float, optional
+        Safety cap on the total acceleration introduced by attached rod
+        vertices, in m/s². Defaults to 10.0.
     """
 
     dt: PositiveFloat | None = None
@@ -957,3 +960,4 @@ class RODOptions(Options):
     disable_constraint_grad: StrictBool = False
     two_way_attachment_forces: StrictBool = False
     two_way_attachment_force_limit: NonNegativeFloat = 0.5
+    two_way_attachment_max_acceleration: PositiveFloat = 10.0
