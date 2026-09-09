@@ -101,6 +101,9 @@ class LegacyCouplerOptions(BaseCouplerOptions):
         Whether to enable coupling between rigid and FEM solvers. Defaults to True.
     rigid_rod : bool, optional
         Whether to enable coupling between rigid and rod solvers. Defaults to True.
+    record_rod_contacts : bool, optional
+        Record per-substep rod/rigid impulses for the most recent full step.
+        Defaults to False; read with the legacy coupler's get_rod_contacts().
     mpm_sph : bool, optional
         Whether to enable coupling between MPM and SPH solvers. Defaults to True.
     mpm_pbd : bool, optional
@@ -118,6 +121,7 @@ class LegacyCouplerOptions(BaseCouplerOptions):
     rigid_pbd: StrictBool = True
     rigid_fem: StrictBool = True
     rigid_rod: StrictBool = True
+    record_rod_contacts: StrictBool = False
     mpm_sph: StrictBool = True
     mpm_pbd: StrictBool = True
     fem_mpm: StrictBool = True

@@ -1019,6 +1019,8 @@ class RODSolver(Solver):
 
     def substep_post_coupling(self, f):
         if self.is_active:
+            if self._constraints_initialized:
+                self.apply_hard_constraints(f)
             self.update_centerline_positions(f)
             self.update_frame_thetas(f)
             for i in qd.static(range(self._n_pbd_iters)):
@@ -2444,6 +2446,7 @@ class RODSolver(Solver):
         if (
             self.vertices_ng[f, i_v, i_b].fixed or 
             self.vertices_ng[f, i_v, i_b].kinematic or 
+            self.vertex_constraints[i_v, i_b].constrained or
             mass <= 0.
         ):
             inv_mass = 0.0

@@ -103,6 +103,12 @@ class LegacyCoupler(RBC):
             self.rod_rigid_gripper_geom_indices = qd.field(
                 dtype=gs.qd_int, needs_grad=False, shape=(self.rigid_solver.n_geoms, self.rod_solver._B)
             )
+            if self.options.record_rod_contacts:
+                shape = (self.sim.substeps, self.rod_solver._n_vertices,
+                         self.rigid_solver.n_geoms, self.rod_solver._B)
+                self._rod_contact_impulses = qd.Vector.field(3, dtype=gs.qd_float, shape=shape)
+                self._rod_contact_positions = qd.Vector.field(3, dtype=gs.qd_float, shape=shape)
+                self._rod_contact_normals = qd.Vector.field(3, dtype=gs.qd_float, shape=shape)
 
         if self._mpm_sph:
             self.mpm_sph_stencil_size = int(np.floor(self.mpm_solver.dx / self.sph_solver.hash_grid_cell_size) + 2)
@@ -130,6 +136,8 @@ class LegacyCoupler(RBC):
                 self._kernel_reset_sph(envs_idx)
 
         if self._rigid_rod:
+            if self.options.record_rod_contacts:
+                self._rod_contact_impulses.fill(0)
             gripper_n_geoms = self.rod_solver.geom_indices.shape[0]
             # -2: uninitialized; -1: gripper not contact; >=0: gripper contact with rod vertex index
             if envs_idx is None:
@@ -996,10 +1004,33 @@ class LegacyCoupler(RBC):
         # collision detection
         self.fem_solver.floor_hydroelastic_detection(f)
 
+    def get_rod_contacts(self):
+        """Read last full step's rod/rigid impulse events in world coordinates.
+
+        Impulses (N s) act ON the rod; rigid reaction is their negative.
+        Position is the rod-centre force application point, not a gel surface.
+        Each substep/vertex/geometry event is retained without temporal averaging.
+        Call after a complete scene.step(); readback does not clear the events.
+        """
+        if not self._rigid_rod or not self.options.record_rod_contacts:
+            raise RuntimeError("Rod contact recording is not enabled")
+        impulses = self._rod_contact_impulses.to_numpy()
+        indices = np.nonzero(np.any(impulses != 0, axis=-1))
+        slots, vertices, geometries, environments = indices
+        link_indices = np.array([geometry.link.idx for geometry in self.rigid_solver.geoms])
+        return dict(
+            substep_index=slots, vertex_index=vertices, geom_index=geometries,
+            environment_index=environments, link_index=link_indices[geometries],
+            position=self._rod_contact_positions.to_numpy()[indices],
+            normal=self._rod_contact_normals.to_numpy()[indices],
+            impulse_on_rod=impulses[indices], substep_dt=self.rigid_solver.substep_dt,
+        )
+
     @qd.kernel
     def rod_vertex_force(
         self,
         f: qd.i32,
+        contact_slot: qd.i32,
         geoms_state: array_class.GeomsState,
         geoms_info: array_class.GeomsInfo,
         links_state: array_class.LinksState,
@@ -1007,6 +1038,11 @@ class LegacyCoupler(RBC):
         sdf_info: array_class.SDFInfo,
         collider_static_config: qd.template(),
     ):
+        if qd.static(self.options.record_rod_contacts):
+            for vertex, geometry, environment in qd.ndrange(
+                self.rod_solver._n_vertices, self.rigid_solver.n_geoms, self.rod_solver._B,
+            ):
+                self._rod_contact_impulses[contact_slot, vertex, geometry, environment] = qd.Vector.zero(gs.qd_float, 3)
         for i_v, i_b in qd.ndrange(self.rod_solver._n_vertices, self.rod_solver._B):
             # ROD <-> Rigid
             if not self.rod_solver.vertex_constraints[i_v, i_b].constrained:
@@ -1028,6 +1064,20 @@ class LegacyCoupler(RBC):
                             sdf_info,
                             collider_static_config,
                         )
+                        if qd.static(self.options.record_rod_contacts):
+                            impulse = self.rod_solver.vertices_param[i_v, i_b].mass * (
+                                vel_rod - self.rod_solver.vertices[f + 1, i_v, i_b].vel
+                            )
+                            self._rod_contact_impulses[contact_slot, i_v, i_g, i_b] = impulse
+                            if impulse.dot(impulse) > 0:
+                                position = self.rod_solver.vertices[f, i_v, i_b].vert
+                                self._rod_contact_positions[contact_slot, i_v, i_g, i_b] = position
+                                self._rod_contact_normals[contact_slot, i_v, i_g, i_b] = sdf.sdf_func_normal_world(
+                                    geoms_state=geoms_state, geoms_info=geoms_info,
+                                    rigid_global_info=rigid_global_info,
+                                    collider_static_config=collider_static_config, sdf_info=sdf_info,
+                                    pos_world=position, geom_idx=i_g, batch_idx=i_b,
+                                )
                         self.rod_solver.vertices[f + 1, i_v, i_b].vel = vel_rod
 
             # vel_rod_prime = self.rod_solver.boundary.impose_vel(
@@ -1078,7 +1128,7 @@ class LegacyCoupler(RBC):
                 rod_force = rod_force * qd.min(1.0, limit / magnitude)
                 self.rigid_solver._func_apply_coupling_force(
                     self.rod_solver.vertices[f, i_v, i_b].vert,
-                    -rod_force,
+                    rod_force,
                     constraint.link_idx,
                     i_b,
                     links_state,
@@ -1412,6 +1462,7 @@ class LegacyCoupler(RBC):
             self.clear_rod_rigid_gripper_geom_indices()
             self.rod_vertex_force(
                 f,
+                self.sim.cur_substep_global % self.sim.substeps,
                 self.rigid_solver.geoms_state,
                 self.rigid_solver.geoms_info,
                 self.rigid_solver.links_state,
