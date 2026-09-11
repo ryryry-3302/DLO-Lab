@@ -470,10 +470,12 @@ class Collider:
                     bounds_a, bounds_b = mesh_a.bounds, mesh_b.bounds
                     if not ((bounds_a[1] < bounds_b[0]).any() or (bounds_b[1] < bounds_a[0]).any()):
                         voxels_a = mesh_a.voxelized(
-                            pitch=min(NEUTRAL_COLLISION_RES_ABS, NEUTRAL_COLLISION_RES_REL * max(mesh_a.extents))
+                            pitch=min(NEUTRAL_COLLISION_RES_ABS, NEUTRAL_COLLISION_RES_REL * max(mesh_a.extents)),
+                            max_iter=20,
                         )
                         voxels_b = mesh_b.voxelized(
-                            pitch=min(NEUTRAL_COLLISION_RES_ABS, NEUTRAL_COLLISION_RES_REL * max(mesh_b.extents))
+                            pitch=min(NEUTRAL_COLLISION_RES_ABS, NEUTRAL_COLLISION_RES_REL * max(mesh_b.extents)),
+                            max_iter=20,
                         )
                         coords_a = voxels_a.indices_to_points(np.argwhere(voxels_a.matrix))
                         coords_b = voxels_b.indices_to_points(np.argwhere(voxels_b.matrix))

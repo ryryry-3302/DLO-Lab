@@ -122,6 +122,12 @@ class LegacyCouplerOptions(BaseCouplerOptions):
     rigid_fem: StrictBool = True
     rigid_rod: StrictBool = True
     record_rod_contacts: StrictBool = False
+    # Optional compliant contact on registered gripper geoms. Unlike the
+    # legacy velocity-only response, this sustains Coulomb friction at rest and
+    # returns equal/opposite contact impulses without attaching rod vertices.
+    rod_gripper_contact_stiffness: NonNegativeFloat = 0.0
+    rod_gripper_contact_damping_ratio: NonNegativeFloat = 0.8
+    rod_gripper_tangential_stiffness_ratio: NonNegativeFloat = 0.5
     mpm_sph: StrictBool = True
     mpm_pbd: StrictBool = True
     fem_mpm: StrictBool = True
