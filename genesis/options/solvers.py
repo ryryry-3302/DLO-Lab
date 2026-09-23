@@ -128,6 +128,10 @@ class LegacyCouplerOptions(BaseCouplerOptions):
     rod_gripper_contact_stiffness: NonNegativeFloat = 0.0
     rod_gripper_contact_damping_ratio: NonNegativeFloat = 0.8
     rod_gripper_tangential_stiffness_ratio: NonNegativeFloat = 0.5
+    # Maximum spacing of interior edge samples used for registered rod/gripper
+    # contact.  Sampling edges closes the gap left by vertex-only collision
+    # queries when a thin finger lies between two rod vertices.
+    rod_gripper_contact_sample_spacing: PositiveFloat = 0.0025
     mpm_sph: StrictBool = True
     mpm_pbd: StrictBool = True
     fem_mpm: StrictBool = True
@@ -971,3 +975,4 @@ class RODOptions(Options):
     two_way_attachment_forces: StrictBool = False
     two_way_attachment_force_limit: NonNegativeFloat = 0.5
     two_way_attachment_max_acceleration: PositiveFloat = 10.0
+    enable_self_collision: StrictBool = True

@@ -107,12 +107,23 @@ class LegacyCoupler(RBC):
                 contact_shape = (self.rod_solver._n_vertices, self.rigid_solver.n_geoms, self.rod_solver._B)
                 self._rod_grip_anchor = qd.Vector.field(3, dtype=gs.qd_float, shape=contact_shape)
                 self._rod_grip_active = qd.field(dtype=gs.qd_bool, shape=contact_shape)
+                self._rod_edge_velocity_source = qd.Vector.field(
+                    3, dtype=gs.qd_float, shape=(self.rod_solver._n_vertices, self.rod_solver._B)
+                )
+                self._rod_edge_velocity_delta = qd.Vector.field(
+                    3, dtype=gs.qd_float, shape=(self.rod_solver._n_vertices, self.rod_solver._B)
+                )
             if self.options.record_rod_contacts:
                 shape = (self.sim.substeps, self.rod_solver._n_vertices,
                          self.rigid_solver.n_geoms, self.rod_solver._B)
                 self._rod_contact_impulses = qd.Vector.field(3, dtype=gs.qd_float, shape=shape)
                 self._rod_contact_positions = qd.Vector.field(3, dtype=gs.qd_float, shape=shape)
                 self._rod_contact_normals = qd.Vector.field(3, dtype=gs.qd_float, shape=shape)
+                edge_shape = (self.sim.substeps, self.rod_solver._n_edges,
+                              self.rigid_solver.n_geoms, self.rod_solver._B)
+                self._rod_edge_contact_impulses = qd.Vector.field(3, dtype=gs.qd_float, shape=edge_shape)
+                self._rod_edge_contact_positions = qd.Vector.field(3, dtype=gs.qd_float, shape=edge_shape)
+                self._rod_edge_contact_normals = qd.Vector.field(3, dtype=gs.qd_float, shape=edge_shape)
 
         if self._mpm_sph:
             self.mpm_sph_stencil_size = int(np.floor(self.mpm_solver.dx / self.sph_solver.hash_grid_cell_size) + 2)
@@ -142,6 +153,7 @@ class LegacyCoupler(RBC):
         if self._rigid_rod:
             if self.options.record_rod_contacts:
                 self._rod_contact_impulses.fill(0)
+                self._rod_edge_contact_impulses.fill(0)
             gripper_n_geoms = self.rod_solver.geom_indices.shape[0]
             # -2: uninitialized; -1: gripper not contact; >=0: gripper contact with rod vertex index
             if envs_idx is None:
@@ -1099,13 +1111,23 @@ class LegacyCoupler(RBC):
         impulses = self._rod_contact_impulses.to_numpy()
         indices = np.nonzero(np.any(impulses != 0, axis=-1))
         slots, vertices, geometries, environments = indices
+        edge_impulses = self._rod_edge_contact_impulses.to_numpy()
+        edge_indices = np.nonzero(np.any(edge_impulses != 0, axis=-1))
+        edge_slots, edges, edge_geometries, edge_environments = edge_indices
         link_indices = np.array([geometry.link.idx for geometry in self.rigid_solver.geoms])
         return dict(
-            substep_index=slots, vertex_index=vertices, geom_index=geometries,
-            environment_index=environments, link_index=link_indices[geometries],
-            position=self._rod_contact_positions.to_numpy()[indices],
-            normal=self._rod_contact_normals.to_numpy()[indices],
-            impulse_on_rod=impulses[indices], substep_dt=self.rigid_solver.substep_dt,
+            substep_index=np.concatenate((slots, edge_slots)),
+            vertex_index=np.concatenate((vertices, np.full(len(edges), -1, dtype=vertices.dtype))),
+            edge_index=np.concatenate((np.full(len(vertices), -1, dtype=edges.dtype), edges)),
+            geom_index=np.concatenate((geometries, edge_geometries)),
+            environment_index=np.concatenate((environments, edge_environments)),
+            link_index=link_indices[np.concatenate((geometries, edge_geometries))],
+            position=np.concatenate((self._rod_contact_positions.to_numpy()[indices],
+                                     self._rod_edge_contact_positions.to_numpy()[edge_indices])),
+            normal=np.concatenate((self._rod_contact_normals.to_numpy()[indices],
+                                   self._rod_edge_contact_normals.to_numpy()[edge_indices])),
+            impulse_on_rod=np.concatenate((impulses[indices], edge_impulses[edge_indices])),
+            substep_dt=self.rigid_solver.substep_dt,
         )
 
     @qd.kernel
@@ -1183,6 +1205,298 @@ class LegacyCoupler(RBC):
             #     self.rod_solver.vertices_param[i_v, i_b].radius,
             # )
             # self.rod_solver.vertices[f + 1, i_v, i_b].vel = vel_rod_prime
+
+    @qd.kernel
+    def prepare_rod_edge_gripper_force(self, f: qd.i32):
+        for i_v, i_b in qd.ndrange(self.rod_solver._n_vertices, self.rod_solver._B):
+            self._rod_edge_velocity_source[i_v, i_b] = self.rod_solver.vertices[f + 1, i_v, i_b].vel
+            self._rod_edge_velocity_delta[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
+
+    @qd.kernel
+    def rod_constrained_vertex_gripper_force(
+        self,
+        f: qd.i32,
+        contact_slot: qd.i32,
+        geoms_state: array_class.GeomsState,
+        geoms_info: array_class.GeomsInfo,
+        links_state: array_class.LinksState,
+        links_info: array_class.LinksInfo,
+        rigid_global_info: array_class.RigidGlobalInfo,
+        sdf_info: array_class.SDFInfo,
+        collider_static_config: qd.template(),
+        rigid_static_config: qd.template(),
+    ):
+        """React registered contact at hard-attached rod endpoint caps."""
+        for i_v, i_g, i_b in qd.ndrange(
+            self.rod_solver._n_vertices, self.rigid_solver.n_geoms, self.rod_solver._B
+        ):
+            constraint = self.rod_solver.vertex_constraints[i_v, i_b]
+            if (
+                constraint.constrained
+                and constraint.link_idx >= 0
+                and geoms_info.needs_coup[i_g]
+                and self.rod_rigid_gripper_geom_indices[i_g, i_b] >= -1
+                and constraint.link_idx != geoms_info.link_idx[i_g]
+            ):
+                pos = self.rod_solver.vertices[f, i_v, i_b].vert
+                radius = self.rod_solver.vertices_param[i_v, i_b].radius
+                signed_dist = sdf.sdf_func_world(
+                    geoms_state=geoms_state, geoms_info=geoms_info, sdf_info=sdf_info,
+                    pos_world=pos, geom_idx=i_g, batch_idx=i_b,
+                ) - radius
+                if signed_dist < 0:
+                    normal = sdf.sdf_func_normal_world(
+                        geoms_state=geoms_state, geoms_info=geoms_info,
+                        rigid_global_info=rigid_global_info,
+                        collider_static_config=collider_static_config, sdf_info=sdf_info,
+                        pos_world=pos, geom_idx=i_g, batch_idx=i_b,
+                    )
+                    attached_vel = self.rigid_solver._func_vel_at_point(
+                        pos, constraint.link_idx, i_b, links_state
+                    )
+                    rigid_vel = self.rigid_solver._func_vel_at_point(
+                        pos, geoms_info.link_idx[i_g], i_b, links_state
+                    )
+                    attachment_I = (
+                        [constraint.link_idx, i_b]
+                        if qd.static(rigid_static_config.batch_links_info)
+                        else constraint.link_idx
+                    )
+                    collider_link = geoms_info.link_idx[i_g]
+                    collider_I = (
+                        [collider_link, i_b]
+                        if qd.static(rigid_static_config.batch_links_info)
+                        else collider_link
+                    )
+                    # Genesis rigid contact uses translational link invweight
+                    # as its articulated effective-mass approximation. Use the
+                    # same reduced mass here: a hard attachment moves its rigid
+                    # bodies, not the 0.155 g bookkeeping mass of one rod vertex.
+                    inverse_mass = (
+                        links_info.invweight[attachment_I][0]
+                        + links_info.invweight[collider_I][0]
+                    )
+                    mass = self.rod_solver.vertices_param[i_v, i_b].mass
+                    if inverse_mass > gs.EPS:
+                        mass = 1.0 / inverse_mass
+                    stiffness = self.options.rod_gripper_contact_stiffness
+                    damping = 2 * self.options.rod_gripper_contact_damping_ratio * qd.sqrt(stiffness * mass)
+                    dt = rigid_global_info.substep_dt[None]
+                    impulse = qd.max(
+                        0.0, (-stiffness * signed_dist - damping * (attached_vel - rigid_vel).dot(normal)) * dt
+                    ) * normal
+                    if impulse.dot(impulse) > 0:
+                        self.rigid_solver._func_apply_coupling_force(
+                            pos, impulse / dt, constraint.link_idx, i_b, links_state
+                        )
+                        self.rigid_solver._func_apply_coupling_force(
+                            pos, -impulse / dt, geoms_info.link_idx[i_g], i_b, links_state
+                        )
+                        if qd.static(self.options.record_rod_contacts):
+                            self._rod_contact_impulses[contact_slot, i_v, i_g, i_b] = impulse
+                            self._rod_contact_positions[contact_slot, i_v, i_g, i_b] = pos
+                            self._rod_contact_normals[contact_slot, i_v, i_g, i_b] = normal
+
+    @qd.kernel
+    def apply_rod_edge_gripper_force(self, f: qd.i32):
+        for i_v, i_b in qd.ndrange(self.rod_solver._n_vertices, self.rod_solver._B):
+            if not self.rod_solver.vertex_constraints[i_v, i_b].constrained:
+                self.rod_solver.vertices[f + 1, i_v, i_b].vel += self._rod_edge_velocity_delta[i_v, i_b]
+
+    @qd.kernel
+    def rod_edge_gripper_force(
+        self,
+        f: qd.i32,
+        contact_slot: qd.i32,
+        geoms_state: array_class.GeomsState,
+        geoms_info: array_class.GeomsInfo,
+        links_state: array_class.LinksState,
+        links_info: array_class.LinksInfo,
+        rigid_global_info: array_class.RigidGlobalInfo,
+        sdf_info: array_class.SDFInfo,
+        collider_static_config: qd.template(),
+        rigid_static_config: qd.template(),
+    ):
+        """Resolve registered rigid contact along rod edges, not only vertices.
+
+        Interior samples are no farther apart than the configured spacing.  A
+        sample impulse is distributed barycentrically to its free endpoints.
+        A constrained endpoint share is routed to its attachment link. This
+        keeps the attachment hard while protecting its adjacent edge.
+        """
+        for i_e, i_g, i_b in qd.ndrange(
+            self.rod_solver._n_edges, self.rigid_solver.n_geoms, self.rod_solver._B
+        ):
+            if qd.static(self.options.record_rod_contacts):
+                self._rod_edge_contact_impulses[contact_slot, i_e, i_g, i_b] = qd.Vector.zero(gs.qd_float, 3)
+            if (
+                geoms_info.needs_coup[i_g]
+                and self.rod_rigid_gripper_geom_indices[i_g, i_b] >= -1
+            ):
+                v0 = self.rod_solver.edges_info[i_e].vert_idx
+                v1 = v0 + 1
+                constraint0 = self.rod_solver.vertex_constraints[v0, i_b]
+                constraint1 = self.rod_solver.vertex_constraints[v1, i_b]
+                free0 = not constraint0.constrained
+                free1 = not constraint1.constrained
+                collider_link = geoms_info.link_idx[i_g]
+                fully_attached_to_collider = (
+                    not free0
+                    and not free1
+                    and constraint0.link_idx == collider_link
+                    and constraint1.link_idx == collider_link
+                )
+                if (
+                    (free0 or free1 or constraint0.link_idx >= 0 or constraint1.link_idx >= 0)
+                    and not fully_attached_to_collider
+                ):
+                    p0 = self.rod_solver.vertices[f, v0, i_b].vert
+                    p1 = self.rod_solver.vertices[f, v1, i_b].vert
+                    vel0 = self._rod_edge_velocity_source[v0, i_b]
+                    vel1 = self._rod_edge_velocity_source[v1, i_b]
+                    if constraint0.constrained and constraint0.link_idx >= 0:
+                        vel0 = self.rigid_solver._func_vel_at_point(
+                            p0, constraint0.link_idx, i_b, links_state
+                        )
+                    if constraint1.constrained and constraint1.link_idx >= 0:
+                        vel1 = self.rigid_solver._func_vel_at_point(
+                            p1, constraint1.link_idx, i_b, links_state
+                        )
+                    mass0 = self.rod_solver.vertices_param[v0, i_b].mass
+                    mass1 = self.rod_solver.vertices_param[v1, i_b].mass
+                    radius = qd.max(
+                        self.rod_solver.vertices_param[v0, i_b].radius,
+                        self.rod_solver.vertices_param[v1, i_b].radius,
+                    )
+                    spacing = self.options.rod_gripper_contact_sample_spacing
+                    n_intervals = qd.max(
+                        1,
+                        qd.cast(qd.ceil(self.rod_solver.edges[f, i_e, i_b].length / spacing), qd.i32),
+                    )
+                    delta0 = qd.Vector.zero(gs.qd_float, 3)
+                    delta1 = qd.Vector.zero(gs.qd_float, 3)
+                    recorded_impulse = qd.Vector.zero(gs.qd_float, 3)
+                    weighted_position = qd.Vector.zero(gs.qd_float, 3)
+                    weighted_normal = qd.Vector.zero(gs.qd_float, 3)
+                    recorded_load = 0.0
+                    for i_s in range(1, n_intervals):
+                            t = qd.cast(i_s, gs.qd_float) / qd.cast(n_intervals, gs.qd_float)
+                            w0 = 1.0 - t
+                            w1 = t
+                            pos = w0 * p0 + w1 * p1
+                            signed_dist = sdf.sdf_func_world(
+                                geoms_state=geoms_state,
+                                geoms_info=geoms_info,
+                                sdf_info=sdf_info,
+                                pos_world=pos,
+                                geom_idx=i_g,
+                                batch_idx=i_b,
+                            ) - radius
+                            if signed_dist < 0:
+                                normal = sdf.sdf_func_normal_world(
+                                    geoms_state=geoms_state,
+                                    geoms_info=geoms_info,
+                                    rigid_global_info=rigid_global_info,
+                                    collider_static_config=collider_static_config,
+                                    sdf_info=sdf_info,
+                                    pos_world=pos,
+                                    geom_idx=i_g,
+                                    batch_idx=i_b,
+                                )
+                                velocity = w0 * vel0 + w1 * vel1
+                                rigid_vel = self.rigid_solver._func_vel_at_point(
+                                    pos_world=pos,
+                                    link_idx=geoms_info.link_idx[i_g],
+                                    i_b=i_b,
+                                    links_state=links_state,
+                                )
+                                normal_vel = (velocity - rigid_vel).dot(normal)
+                                # Divide stiffness and represented mass by the
+                                # quadrature count so refinement does not make
+                                # the same edge artificially stiffer.
+                                stiffness = self.options.rod_gripper_contact_stiffness / qd.cast(n_intervals, gs.qd_float)
+                                inverse_sample_mass = 0.0
+                                if free0:
+                                    inverse_sample_mass += w0 * w0 / mass0
+                                if free1:
+                                    inverse_sample_mass += w1 * w1 / mass1
+                                collider_I = (
+                                    [collider_link, i_b]
+                                    if qd.static(rigid_static_config.batch_links_info)
+                                    else collider_link
+                                )
+                                collider_weight = 1.0
+                                if not free0 and constraint0.link_idx == collider_link:
+                                    collider_weight -= w0
+                                if not free1 and constraint1.link_idx == collider_link:
+                                    collider_weight -= w1
+                                inverse_sample_mass += (
+                                    collider_weight * collider_weight * links_info.invweight[collider_I][0]
+                                )
+                                if not free0 and constraint0.link_idx >= 0 and constraint0.link_idx != collider_link:
+                                    attachment0_I = (
+                                        [constraint0.link_idx, i_b]
+                                        if qd.static(rigid_static_config.batch_links_info)
+                                        else constraint0.link_idx
+                                    )
+                                    attached_weight = w0
+                                    if (
+                                        not free1
+                                        and constraint1.link_idx == constraint0.link_idx
+                                    ):
+                                        attached_weight += w1
+                                    inverse_sample_mass += attached_weight * attached_weight * links_info.invweight[attachment0_I][0]
+                                if (
+                                    not free1
+                                    and constraint1.link_idx >= 0
+                                    and constraint1.link_idx != collider_link
+                                    and (free0 or constraint1.link_idx != constraint0.link_idx)
+                                ):
+                                    attachment1_I = (
+                                        [constraint1.link_idx, i_b]
+                                        if qd.static(rigid_static_config.batch_links_info)
+                                        else constraint1.link_idx
+                                    )
+                                    inverse_sample_mass += w1 * w1 * links_info.invweight[attachment1_I][0]
+                                sample_mass = (w0 * mass0 + w1 * mass1) / qd.cast(n_intervals, gs.qd_float)
+                                if inverse_sample_mass > 0:
+                                    sample_mass = 1.0 / (inverse_sample_mass * qd.cast(n_intervals, gs.qd_float))
+                                damping = 2 * self.options.rod_gripper_contact_damping_ratio * qd.sqrt(stiffness * sample_mass)
+                                dt = rigid_global_info.substep_dt[None]
+                                impulse = qd.max(0.0, (-stiffness * signed_dist - damping * normal_vel) * dt) * normal
+                                if impulse.dot(impulse) > 0:
+                                    if free0:
+                                        delta0 += w0 * impulse / mass0
+                                    elif constraint0.link_idx >= 0:
+                                        self.rigid_solver._func_apply_coupling_force(
+                                            p0, w0 * impulse / dt, constraint0.link_idx, i_b, links_state
+                                        )
+                                    if free1:
+                                        delta1 += w1 * impulse / mass1
+                                    elif constraint1.link_idx >= 0:
+                                        self.rigid_solver._func_apply_coupling_force(
+                                            p1, w1 * impulse / dt, constraint1.link_idx, i_b, links_state
+                                        )
+                                    self.rigid_solver._func_apply_coupling_force(
+                                        pos, -impulse / dt, geoms_info.link_idx[i_g], i_b, links_state
+                                    )
+                                    recorded_impulse += impulse
+                                    load = impulse.norm(gs.EPS)
+                                    recorded_load += load
+                                    weighted_position += load * pos
+                                    weighted_normal += load * normal
+                    for k in qd.static(range(3)):
+                        if free0:
+                            qd.atomic_add(self._rod_edge_velocity_delta[v0, i_b][k], delta0[k])
+                        if free1:
+                            qd.atomic_add(self._rod_edge_velocity_delta[v1, i_b][k], delta1[k])
+                    if qd.static(self.options.record_rod_contacts):
+                        if recorded_impulse.dot(recorded_impulse) > 0:
+                            recorded_position = weighted_position / recorded_load
+                            recorded_normal = weighted_normal.normalized(gs.EPS)
+                            self._rod_edge_contact_impulses[contact_slot, i_e, i_g, i_b] = recorded_impulse
+                            self._rod_edge_contact_positions[contact_slot, i_e, i_g, i_b] = recorded_position
+                            self._rod_edge_contact_normals[contact_slot, i_e, i_g, i_b] = recorded_normal
 
     def rod_rigid_link_constraints(self, f):
         if self.rigid_solver.is_active:
@@ -1567,6 +1881,33 @@ class LegacyCoupler(RBC):
                 self.rigid_solver.collider._sdf._sdf_info,
                 self.rigid_solver.collider._collider_static_config,
             )
+            if self.options.rod_gripper_contact_stiffness > 0:
+                self.rod_constrained_vertex_gripper_force(
+                    f,
+                    self.sim.cur_substep_global % self.sim.substeps,
+                    self.rigid_solver.geoms_state,
+                    self.rigid_solver.geoms_info,
+                    self.rigid_solver.links_state,
+                    self.rigid_solver.links_info,
+                    self.rigid_solver._rigid_global_info,
+                    self.rigid_solver.collider._sdf._sdf_info,
+                    self.rigid_solver.collider._collider_static_config,
+                    self.rigid_solver._static_rigid_sim_config,
+                )
+                self.prepare_rod_edge_gripper_force(f)
+                self.rod_edge_gripper_force(
+                    f,
+                    self.sim.cur_substep_global % self.sim.substeps,
+                    self.rigid_solver.geoms_state,
+                    self.rigid_solver.geoms_info,
+                    self.rigid_solver.links_state,
+                    self.rigid_solver.links_info,
+                    self.rigid_solver._rigid_global_info,
+                    self.rigid_solver.collider._sdf._sdf_info,
+                    self.rigid_solver.collider._collider_static_config,
+                    self.rigid_solver._static_rigid_sim_config,
+                )
+                self.apply_rod_edge_gripper_force(f)
             self.rod_rigid_link_constraints(f)
 
     def couple_grad(self, f):

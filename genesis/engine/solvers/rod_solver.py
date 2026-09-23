@@ -145,6 +145,7 @@ class RODSolver(Solver):
         self._two_way_attachment_forces = options.two_way_attachment_forces
         self._two_way_attachment_force_limit = options.two_way_attachment_force_limit
         self._two_way_attachment_max_acceleration = options.two_way_attachment_max_acceleration
+        self._enable_self_collision = options.enable_self_collision
         self._max_collision_grad_norm = 0.1
 
         # properties
@@ -442,6 +443,8 @@ class RODSolver(Solver):
 
                 # 2. ignore adjacent edges on the same rod
                 if rod_id_i == rod_id_j:
+                    if not self._enable_self_collision:
+                        continue
                     if is_loop_i:
                         n_verts_in_rod = self.rods_info[rod_id_i].n_verts
                         dist_forward = local_id_j - local_id_i
@@ -468,17 +471,19 @@ class RODSolver(Solver):
             penetration=gs.qd_float,
         )
 
+        alloc_edge_pairs = max(1, self._n_valid_edge_pairs)
         self.rr_constraint_info = struct_rr_info.field(
-            shape=self._n_valid_edge_pairs, layout=qd.Layout.SOA
+            shape=alloc_edge_pairs, layout=qd.Layout.SOA
         )
 
         self.rr_constraints = struct_rr_state.field(
-            shape=self._batch_shape((self.sim.substeps_local + 1, self._n_valid_edge_pairs)),
+            shape=self._batch_shape((self.sim.substeps_local + 1, alloc_edge_pairs)),
             needs_grad=True,
             layout=qd.Layout.AOS
         )
 
-        self.rr_constraint_info.valid_pair.from_numpy(valid_edge_pairs)
+        if self._n_valid_edge_pairs > 0:
+            self.rr_constraint_info.valid_pair.from_numpy(valid_edge_pairs)
 
     def register_gripper_geom_indices(self, geom_indices: Iterable[int]=()):
         """
@@ -1025,7 +1030,8 @@ class RODSolver(Solver):
             self.update_frame_thetas(f)
             for i in qd.static(range(self._n_pbd_iters)):
                 self.inextensibility_forward(f, i)
-                self.collision_forward(f, i)
+                if self._enable_self_collision and self._n_valid_edge_pairs > 0:
+                    self.collision_forward(f, i)
             self.update_centerline_edges(f)
             self.update_material_states(f)
             self.update_velocities_after_projection(f)
@@ -1044,7 +1050,8 @@ class RODSolver(Solver):
             self.update_centerline_edges.grad(f)
             if not self._disable_constraint_grad:
                 for i in range(self._n_pbd_iters - 1, -1, -1):
-                    self.collision_forward.grad(self, f, i)
+                    if self._enable_self_collision and self._n_valid_edge_pairs > 0:
+                        self.collision_forward.grad(self, f, i)
                     if self._any_inextensible:
                         self.inextensibility_forward.grad(self, f, i)
             self.update_frame_thetas.grad(f)
