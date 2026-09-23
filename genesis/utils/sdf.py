@@ -80,6 +80,27 @@ def sdf_kernel_init_geom_fields(
 
 
 @qd.func
+def sdf_func_box_local(pos, half_size):
+    """Exact box distance and gradient, including outside the voxel SDF domain."""
+    delta = qd.abs(pos) - half_size
+    outside = qd.max(delta, 0.0)
+    distance = outside.norm() + qd.min(delta.max(), 0.0)
+    normal = qd.Vector.zero(gs.qd_float, 3)
+    if outside.dot(outside) > 0:
+        normal = outside / outside.norm()
+        for axis in qd.static(range(3)):
+            if pos[axis] < 0:
+                normal[axis] = -normal[axis]
+    else:
+        nearest = 0
+        for axis in qd.static(range(1, 3)):
+            if delta[axis] > delta[nearest]:
+                nearest = axis
+        normal[nearest] = 1.0 if pos[nearest] >= 0 else -1.0
+    return distance, normal
+
+
+@qd.func
 def sdf_func_world(
     geoms_state: array_class.GeomsState,
     geoms_info: array_class.GeomsInfo,
@@ -122,6 +143,12 @@ def sdf_func_world_local(
 
     if geoms_info.type[geom_idx] == gs.GEOM_TYPE.SPHERE:
         sd = (pos_world - geom_pos).norm() - geoms_info.data[geom_idx][0]
+
+    elif geoms_info.type[geom_idx] == gs.GEOM_TYPE.BOX:
+        pos_mesh = gu.qd_inv_transform_by_trans_quat(pos_world, geom_pos, geom_quat)
+        data = geoms_info.data[geom_idx]
+        half_size = qd.Vector([data[0], data[1], data[2]]) * 0.5
+        sd, _ = sdf_func_box_local(pos_mesh, half_size)
 
     elif geoms_info.type[geom_idx] == gs.GEOM_TYPE.PLANE:
         pos_mesh = gu.qd_inv_transform_by_trans_quat(pos_world, geom_pos, geom_quat)
@@ -390,6 +417,13 @@ def sdf_func_grad_world_local(
 
     if geoms_info.type[geom_idx] == gs.GEOM_TYPE.SPHERE:
         grad_world = gu.qd_normalize(pos_world - geom_pos, EPS)
+
+    elif geoms_info.type[geom_idx] == gs.GEOM_TYPE.BOX:
+        pos_mesh = gu.qd_inv_transform_by_trans_quat(pos_world, geom_pos, geom_quat)
+        data = geoms_info.data[geom_idx]
+        half_size = qd.Vector([data[0], data[1], data[2]]) * 0.5
+        _, grad_mesh = sdf_func_box_local(pos_mesh, half_size)
+        grad_world = gu.qd_transform_by_quat(grad_mesh, geom_quat)
 
     elif geoms_info.type[geom_idx] == gs.GEOM_TYPE.PLANE:
         geom_data = geoms_info.data[geom_idx]

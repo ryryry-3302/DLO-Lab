@@ -19,7 +19,13 @@ def main():
     parser.add_argument("--fov", type=float, default=30.0)
     parser.add_argument("-n", "--n_envs", type=int, default=1)
     parser.add_argument("-r", "--raytracer", action="store_true", default=False)
+    parser.add_argument("--teleop", action="store_true", default=False,
+                        help="Keyboard Cartesian control instead of the scripted grasp/lift sequence")
     args = parser.parse_args()
+    if args.teleop and not args.vis:
+        parser.error("--teleop requires --vis")
+    if args.teleop and args.n_envs != 1:
+        parser.error("--teleop currently supports exactly one environment")
 
     ########################## init ##########################
     gs.init(seed=0, precision="64", logging_level="info", backend=gs.gpu)
@@ -161,6 +167,47 @@ def main():
     )
 
     end_effector = franka.get_link("panda_grasptarget")
+
+    if args.teleop:
+        from genesis.vis.keybindings import Key, KeyAction, Keybind
+
+        target_pos = np.array([0.65, 0.0, 0.20])
+        target_quat = np.array([0.0, 1.0, 0.0, 0.0])
+        closed = {"value": False}
+        position_step = 0.004
+
+        def move(delta):
+            target_pos[:] += delta
+
+        def set_gripper(is_closed):
+            closed["value"] = is_closed
+
+        scene.viewer.register_keybinds(
+            Keybind("teleop_x_negative", Key.UP, KeyAction.HOLD, callback=move, args=((-position_step, 0.0, 0.0),)),
+            Keybind("teleop_x_positive", Key.DOWN, KeyAction.HOLD, callback=move, args=((position_step, 0.0, 0.0),)),
+            Keybind("teleop_y_negative", Key.LEFT, KeyAction.HOLD, callback=move, args=((0.0, -position_step, 0.0),)),
+            Keybind("teleop_y_positive", Key.RIGHT, KeyAction.HOLD, callback=move, args=((0.0, position_step, 0.0),)),
+            Keybind("teleop_z_negative", Key.J, KeyAction.HOLD, callback=move, args=((0.0, 0.0, -position_step),)),
+            Keybind("teleop_z_positive", Key.K, KeyAction.HOLD, callback=move, args=((0.0, 0.0, position_step),)),
+            Keybind("teleop_close_gripper", Key.SPACE, KeyAction.PRESS, callback=set_gripper, args=(True,)),
+            Keybind("teleop_open_gripper", Key.SPACE, KeyAction.RELEASE, callback=set_gripper, args=(False,)),
+            Keybind("teleop_stop", Key.ESCAPE, KeyAction.RELEASE, callback=scene.viewer.stop),
+            overwrite=True,
+        )
+        print("Keyboard teleop: arrows=XY, J/K=down/up, hold SPACE=close gripper, ESC=stop.")
+        while scene.viewer.is_alive():
+            qpos = franka.inverse_kinematics(
+                link=end_effector,
+                pos=target_pos[None, :],
+                quat=target_quat[None, :],
+            )
+            franka.control_dofs_position(qpos[..., :-2], motors_dof)
+            franka.control_dofs_position(
+                -0.03 if closed["value"] else 0.04,
+                fingers_dof,
+            )
+            scene.step()
+        return
 
     # Stage 1: move to pre-grasp pose
     qpos = franka.inverse_kinematics(

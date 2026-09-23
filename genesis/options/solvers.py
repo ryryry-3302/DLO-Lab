@@ -101,6 +101,9 @@ class LegacyCouplerOptions(BaseCouplerOptions):
         Whether to enable coupling between rigid and FEM solvers. Defaults to True.
     rigid_rod : bool, optional
         Whether to enable coupling between rigid and rod solvers. Defaults to True.
+    record_rod_contacts : bool, optional
+        Record per-substep rod/rigid impulses for the most recent full step.
+        Defaults to False; read with the legacy coupler's get_rod_contacts().
     mpm_sph : bool, optional
         Whether to enable coupling between MPM and SPH solvers. Defaults to True.
     mpm_pbd : bool, optional
@@ -118,6 +121,17 @@ class LegacyCouplerOptions(BaseCouplerOptions):
     rigid_pbd: StrictBool = True
     rigid_fem: StrictBool = True
     rigid_rod: StrictBool = True
+    record_rod_contacts: StrictBool = False
+    # Optional compliant contact on registered gripper geoms. Unlike the
+    # legacy velocity-only response, this sustains Coulomb friction at rest and
+    # returns equal/opposite contact impulses without attaching rod vertices.
+    rod_gripper_contact_stiffness: NonNegativeFloat = 0.0
+    rod_gripper_contact_damping_ratio: NonNegativeFloat = 0.8
+    rod_gripper_tangential_stiffness_ratio: NonNegativeFloat = 0.5
+    # Maximum spacing of interior edge samples used for registered rod/gripper
+    # contact.  Sampling edges closes the gap left by vertex-only collision
+    # queries when a thin finger lies between two rod vertices.
+    rod_gripper_contact_sample_spacing: PositiveFloat = 0.0025
     mpm_sph: StrictBool = True
     mpm_pbd: StrictBool = True
     fem_mpm: StrictBool = True
@@ -934,6 +948,15 @@ class RODOptions(Options):
         If True, the rod twisting stiffness G is differentiable. Defaults to False.
     disable_constraint_grad: bool, optional
         If True, skip the backpropagation for constraint projection. Defaults to False.
+    two_way_attachment_forces : bool, optional
+        If True, apply bounded axial reaction forces from rod vertices attached
+        to rigid links. This experimental feature is disabled by default.
+    two_way_attachment_force_limit : float, optional
+        Per-vertex magnitude cap in newtons for the experimental two-way
+        attachment reaction. Defaults to 0.5.
+    two_way_attachment_max_acceleration : float, optional
+        Safety cap on the total acceleration introduced by attached rod
+        vertices, in m/s². Defaults to 10.0.
     """
 
     dt: PositiveFloat | None = None
@@ -949,3 +972,7 @@ class RODOptions(Options):
     requires_grad_E: StrictBool = False
     requires_grad_G: StrictBool = False
     disable_constraint_grad: StrictBool = False
+    two_way_attachment_forces: StrictBool = False
+    two_way_attachment_force_limit: NonNegativeFloat = 0.5
+    two_way_attachment_max_acceleration: PositiveFloat = 10.0
+    enable_self_collision: StrictBool = True
