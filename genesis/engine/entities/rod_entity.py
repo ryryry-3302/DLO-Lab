@@ -6,6 +6,7 @@ import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.states.cache import QueriedStates
 from genesis.engine.states.entities import RODEntityState
+import genesis.utils.array_class as array_class
 from genesis.utils.sdf import sdf_func_find_closest_vert
 from genesis.utils.misc import to_gs_tensor, tensor_to_array
 
@@ -1514,9 +1515,9 @@ class RODEntity(Entity):
         # (B, len(verts_ids), 3)
         v_pos_world = self.get_all_verts_tc(False)[:, verts_ids, :]
         # (B, 3)
-        l_pos = rigid_link.get_pos()
+        l_pos = rigid_link.get_pos(relative=False)
         # (B, 4)
-        l_quat = rigid_link.get_quat()
+        l_quat = rigid_link.get_quat(relative=False)
         # (B, 4, 4)
         l_T_inv = gu.trans_quat_to_T(l_pos, l_quat).inverse()
         v_hpos_world = torch.nn.functional.pad(
@@ -1563,9 +1564,9 @@ class RODEntity(Entity):
         # (1, len(verts_ids), 3)
         v_pos_world = self.get_all_verts_tc(False)[envs_idx, verts_ids, :].unsqueeze(0)
         # (1, 3)
-        l_pos = rigid_link.get_pos()[envs_idx, :].unsqueeze(0)
+        l_pos = rigid_link.get_pos(relative=False)[envs_idx, :].unsqueeze(0)
         # (1, 4)
-        l_quat = rigid_link.get_quat()[envs_idx, :].unsqueeze(0)
+        l_quat = rigid_link.get_quat(relative=False)[envs_idx, :].unsqueeze(0)
         # (1, 4, 4)
         l_T_inv = gu.trans_quat_to_T(l_pos, l_quat).inverse()
         v_hpos_world = torch.nn.functional.pad(
@@ -2064,24 +2065,24 @@ class RODEntity(Entity):
         self,
         geom_idx: qd.i32,
         nearest_points: qd.types.ndarray(),
+        dyn_state: array_class.DynState,
+        dyn_info: array_class.DynInfo,
+        collider_info: array_class.ColliderInfo,
     ):
         for i_v, i_b in qd.ndrange(self.n_vertices, self._sim._B):
             i_global = i_v + self.v_start
             i_va = sdf_func_find_closest_vert(
-                geoms_state=self.sim.rigid_solver.geoms_state,
-                geoms_info=self.sim.rigid_solver.geoms_info,
-                sdf_info=self.sim.rigid_solver.sdf._sdf_info,
-                pos_world=self._solver.vertices[0, i_global, i_b].vert,
-                geom_idx=geom_idx,
-                i_b=i_b
+                geom_idx, i_b, self._solver.vertices[0, i_global, i_b].vert, dyn_state, dyn_info, collider_info
             )
-            g_pos = self.sim.rigid_solver.geoms_state.pos[geom_idx, i_b]
-            g_quat = self.sim.rigid_solver.geoms_state.quat[geom_idx, i_b]
-            n_pos = gu.qd_transform_by_trans_quat(
-                self.sim.rigid_solver.verts_info.init_pos[i_va], g_pos, g_quat
-            )
+            g_pos = dyn_state.geoms.pos[geom_idx, i_b]
+            g_quat = dyn_state.geoms.quat[geom_idx, i_b]
+            n_pos = gu.qd_transform_by_trans_quat(dyn_info.verts.init_pos[i_va], g_pos, g_quat)
             for j in qd.static(range(3)):
                 nearest_points[i_b, i_v, j] = n_pos[j]
+
+    def _nearest_verts_args(self):
+        rigid_solver = self.sim.rigid_solver
+        return rigid_solver.dyn_state, rigid_solver.dyn_info, rigid_solver.collider.collider_info
 
     @gs.assert_built
     def get_nearest_verts_from_rigid_geom(self, geom_idx):
@@ -2092,7 +2093,7 @@ class RODEntity(Entity):
             # "scene": self.scene,
         }
         nearest_points = np.zeros(base_v_shape, **args)
-        self.get_nearest_verts_from_rigid_geom_kernel(geom_idx, nearest_points)
+        self.get_nearest_verts_from_rigid_geom_kernel(geom_idx, nearest_points, *self._nearest_verts_args())
         return nearest_points
 
     @gs.assert_built
@@ -2104,7 +2105,7 @@ class RODEntity(Entity):
             # "scene": self.scene,
         }
         nearest_points = torch.zeros(base_v_shape, **args)
-        self.get_nearest_verts_from_rigid_geom_kernel(geom_idx, nearest_points)
+        self.get_nearest_verts_from_rigid_geom_kernel(geom_idx, nearest_points, *self._nearest_verts_args())
         return nearest_points
 
     @qd.kernel

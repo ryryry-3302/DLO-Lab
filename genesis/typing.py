@@ -3,6 +3,7 @@ from pathlib import PurePath
 from typing import TYPE_CHECKING, Annotated, Any, Mapping, Sequence, TypeVar, get_args
 
 import numpy as np
+import torch
 from frozendict import frozendict
 from pydantic import BeforeValidator, Field, GetCoreSchemaHandler, GetPydanticSchema
 from pydantic_core import PydanticCustomError, core_schema
@@ -30,6 +31,16 @@ def _normalize(vec):
         vec = tuple(e * inv_norm for e in vec)
         return vec
     raise PydanticCustomError("zero_division", "Cannot be normalized", {"value": vec})
+
+
+def _to_float_grid(v):
+    """Coerce a nested sequence, an array or a tensor to a two-dimensional float64 array."""
+    if isinstance(v, torch.Tensor):
+        v = v.detach().cpu()
+    grid = np.asarray(v, dtype=np.float64)
+    if grid.ndim != 2:
+        raise PydanticCustomError("invalid_type", "Input should be a two-dimensional grid", {"value": v})
+    return grid
 
 
 def is_sequence(v):
@@ -104,6 +115,11 @@ if TYPE_CHECKING:
     UnitVec3FArrayType = Vec3FArrayType
     Vec3FLaxArrayType = Vec3FArrayType | Vec3FType
     UnitVec3FLaxArrayType = Vec3FLaxArrayType
+    FGridType = Sequence[Sequence[NumericType]] | np.ndarray
+    FGridArrayType = Sequence[Sequence[NumericType]] | np.ndarray
+    PositiveFGridType = FGridType
+    Vec3FGridType = Sequence[Sequence[Sequence[NumericType]]] | np.ndarray
+    UnitVec3FGridType = Vec3FGridType
     RotationMatrixType = Vec3FArrayType
     Matrix3x3Type = Sequence[Sequence[NumericType]] | np.ndarray
     Matrix4x4Type = Sequence[Sequence[NumericType]] | np.ndarray
@@ -165,6 +181,10 @@ else:
     StrArrayType = Annotated[tuple[str, ...], Field(strict=False)]
     Vec3FArrayType = Annotated[tuple[Vec3FType, ...], Field(min_length=1, strict=False)]
     UnitVec3FArrayType = Annotated[tuple[UnitVec3FType, ...], Field(min_length=1, strict=False)]
+    FGridType = Annotated[tuple[FArrayType, ...], Field(min_length=1, strict=False)]
+    PositiveFGridType = Annotated[tuple[PositiveFArrayType, ...], Field(min_length=1, strict=False)]
+    Vec3FGridType = Annotated[tuple[Vec3FArrayType, ...], Field(min_length=1, strict=False)]
+    UnitVec3FGridType = Annotated[tuple[UnitVec3FArrayType, ...], Field(min_length=1, strict=False)]
     Vec3FLaxArrayType = Annotated[
         tuple[Vec3FType, ...],
         BeforeValidator(lambda v: v if is_sequence(v) and len(v) > 0 and is_sequence(v[0]) else (v,)),
@@ -195,5 +215,6 @@ else:
     NDArrayType = Annotated[
         np.ndarray, GetPydanticSchema(lambda tp, handler: core_schema.no_info_plain_validator_function(lambda v: v))
     ]
+    FGridArrayType = Annotated[NDArrayType, BeforeValidator(_to_float_grid)]
     PathType = Annotated[str, BeforeValidator(lambda v: str(v) if isinstance(v, PurePath) else v)]
     FrozenDictType = Annotated[frozendict[_K, _V], _FrozenDictValidator]
