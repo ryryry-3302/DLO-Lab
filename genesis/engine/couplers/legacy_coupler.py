@@ -28,11 +28,7 @@ class LegacyCoupler(RBC):
     # --------------------------------- Initialization -----------------------------------
     # ------------------------------------------------------------------------------------
 
-    def __init__(
-        self,
-        simulator: "Simulator",
-        options: "LegacyCouplerOptions",
-    ) -> None:
+    def __init__(self, simulator: "Simulator", options: "LegacyCouplerOptions") -> None:
         self.sim = simulator
         self.options = options
 
@@ -56,6 +52,8 @@ class LegacyCoupler(RBC):
         self._fem_mpm = self.fem_solver.is_active and self.mpm_solver.is_active and self.options.fem_mpm
         self._fem_sph = self.fem_solver.is_active and self.sph_solver.is_active and self.options.fem_sph
         self._rod_mpm = self.rod_solver.is_active and self.mpm_solver.is_active and self.options.rod_mpm
+        # Rod vertices near an attachment ignore the link they are attached to (RODOptions.attached_link_collision_window).
+        self._rod_link_exclusion = self._rigid_rod and self.rod_solver._attached_link_window > 0
 
         if (self._rigid_mpm or self._rigid_sph or self._rigid_pbd or self._rigid_fem or self._rigid_rod) and any(
             geom.needs_coup for geom in self.rigid_solver.geoms
@@ -88,10 +86,7 @@ class LegacyCoupler(RBC):
                 3, dtype=gs.qd_float, shape=(self.pbd_solver.n_particles, self.pbd_solver._B, self.rigid_solver.n_geoms)
             )
 
-            struct_particle_attach_info = qd.types.struct(
-                link_idx=gs.qd_int,
-                local_pos=gs.qd_vec3,
-            )
+            struct_particle_attach_info = qd.types.struct(link_idx=gs.qd_int, local_pos=gs.qd_vec3)
 
             self.particle_attach_info = struct_particle_attach_info.field(
                 shape=(self.pbd_solver._n_particles, self.pbd_solver._B), layout=qd.Layout.SOA
@@ -199,7 +194,7 @@ class LegacyCoupler(RBC):
         geoms_state: array_class.GeomsState,
         geoms_info: array_class.GeomsInfo,
         links_state: array_class.LinksState,
-        rigid_global_info: array_class.RigidGlobalInfo,
+        rigid_info: array_class.RigidInfo,
         sdf_info: array_class.SDFInfo,
         collider_static_config: qd.template(),
     ):
@@ -214,7 +209,7 @@ class LegacyCoupler(RBC):
                     geoms_state=geoms_state,
                     geoms_info=geoms_info,
                     links_state=links_state,
-                    rigid_global_info=rigid_global_info,
+                    rigid_info=rigid_info,
                     sdf_info=sdf_info,
                     collider_static_config=collider_static_config,
                 )
@@ -231,44 +226,21 @@ class LegacyCoupler(RBC):
         geoms_state: array_class.GeomsState,
         geoms_info: array_class.GeomsInfo,
         links_state: array_class.LinksState,
-        rigid_global_info: array_class.RigidGlobalInfo,
+        rigid_info: array_class.RigidInfo,
         sdf_info: array_class.SDFInfo,
         collider_static_config: qd.template(),
     ):
-        signed_dist = sdf.sdf_func_world(
-            geoms_state=geoms_state,
-            geoms_info=geoms_info,
-            sdf_info=sdf_info,
-            pos_world=pos_world,
-            geom_idx=geom_idx,
-            batch_idx=batch_idx,
-        )
+        signed_dist = sdf.sdf_func_world(geom_idx, batch_idx, pos_world, geoms_state, geoms_info, sdf_info)
 
         # bigger coup_softness implies that the coupling influence extends further away from the object.
         influence = qd.min(qd.exp(-signed_dist / max(1e-10, geoms_info.coup_softness[geom_idx])), 1)
 
         if influence > 0.1:
             normal_rigid = sdf.sdf_func_normal_world(
-                geoms_state=geoms_state,
-                geoms_info=geoms_info,
-                rigid_global_info=rigid_global_info,
-                collider_static_config=collider_static_config,
-                sdf_info=sdf_info,
-                pos_world=pos_world,
-                geom_idx=geom_idx,
-                batch_idx=batch_idx,
+                geom_idx, batch_idx, pos_world, geoms_state, geoms_info, rigid_info, sdf_info, collider_static_config
             )
             vel = self._func_collide_in_rigid_geom(
-                pos_world,
-                vel,
-                mass,
-                normal_rigid,
-                influence,
-                geom_idx,
-                batch_idx,
-                geoms_info,
-                links_state,
-                rigid_global_info,
+                pos_world, vel, mass, normal_rigid, influence, geom_idx, batch_idx, geoms_info, links_state, rigid_info
             )
 
         return vel
@@ -279,36 +251,24 @@ class LegacyCoupler(RBC):
         pos_world,
         vel,
         mass,
+        pressure,
         normal_prev,
         geom_idx,
         batch_idx,
         geoms_state: array_class.GeomsState,
         geoms_info: array_class.GeomsInfo,
         links_state: array_class.LinksState,
-        rigid_global_info: array_class.RigidGlobalInfo,
+        links_info: array_class.LinksInfo,
+        rigid_info: array_class.RigidInfo,
         sdf_info: array_class.SDFInfo,
         collider_static_config: qd.template(),
     ):
         """
         Similar to _func_collide_with_rigid_geom, but additionally handles potential side flip due to penetration.
         """
-        signed_dist = sdf.sdf_func_world(
-            geoms_state=geoms_state,
-            geoms_info=geoms_info,
-            sdf_info=sdf_info,
-            pos_world=pos_world,
-            geom_idx=geom_idx,
-            batch_idx=batch_idx,
-        )
+        signed_dist = sdf.sdf_func_world(geom_idx, batch_idx, pos_world, geoms_state, geoms_info, sdf_info)
         normal_rigid = sdf.sdf_func_normal_world(
-            geoms_state=geoms_state,
-            geoms_info=geoms_info,
-            rigid_global_info=rigid_global_info,
-            collider_static_config=collider_static_config,
-            sdf_info=sdf_info,
-            pos_world=pos_world,
-            geom_idx=geom_idx,
-            batch_idx=batch_idx,
+            geom_idx, batch_idx, pos_world, geoms_state, geoms_info, rigid_info, sdf_info, collider_static_config
         )
 
         # bigger coup_softness implies that the coupling influence extends further away from the object.
@@ -319,17 +279,29 @@ class LegacyCoupler(RBC):
         #     normal_rigid = normal_prev
         if influence > 0.1:
             vel = self._func_collide_in_rigid_geom(
-                pos_world,
-                vel,
-                mass,
-                normal_rigid,
-                influence,
-                geom_idx,
-                batch_idx,
-                geoms_info,
-                links_state,
-                rigid_global_info,
+                pos_world, vel, mass, normal_rigid, influence, geom_idx, batch_idx, geoms_info, links_state, rigid_info
             )
+
+        # Static fluid pressure pushes on the geom even at rest, where the velocity-gated collision response above
+        # transfers nothing; this is what makes submerged geoms buoyant. Mirroring the particle pressure across the
+        # surface and integrating the symmetric pressure force over the truncated kernel support yields the factor
+        # 2 * sigma(signed_dist), with sigma the kernel plane integral (see cubic_kernel_plane_integral in
+        # sph_solver.py). Sigma integrates to 1/2 across the support band, so a covering particle layer transmits
+        # exactly p per unit area: Archimedes buoyancy with no tuning constant. Fixed links are exempt: they cannot
+        # respond to the force, and the reaction is a conservative stiff kick that keeps fluid resting on them
+        # ringing forever, pumped by the acoustic pressure fluctuations of the fluid.
+        link_idx = geoms_info.link_idx[geom_idx]
+        I_l = [link_idx, batch_idx] if qd.static(self.rigid_solver._options.batch_links_info) else link_idx
+        if signed_dist < self.sph_solver._support_radius and pressure > 0 and not links_info.is_fixed[I_l]:
+            pressure_force = (
+                -2.0
+                * pressure
+                * self.sph_solver._particle_volume
+                * self.sph_solver.cubic_kernel_plane_integral(signed_dist)
+                * normal_rigid
+            )
+            self.rigid_solver._func_apply_coupling_force(link_idx, batch_idx, pos_world, pressure_force, links_state)
+            vel = vel - pressure_force * (rigid_info.substep_dt[None] / mass)
 
         # attraction force
         # if 0.001 < signed_dist < 0.01:
@@ -351,7 +323,7 @@ class LegacyCoupler(RBC):
         geoms_state: array_class.GeomsState,
         geoms_info: array_class.GeomsInfo,
         links_state: array_class.LinksState,
-        rigid_global_info: array_class.RigidGlobalInfo,
+        rigid_info: array_class.RigidInfo,
         sdf_info: array_class.SDFInfo,
         collider_static_config: qd.template(),
     ):
@@ -375,7 +347,7 @@ class LegacyCoupler(RBC):
             normal_rigid = sdf.sdf_func_normal_world(
                 geoms_state=geoms_state,
                 geoms_info=geoms_info,
-                rigid_global_info=rigid_global_info,
+                rigid_info=rigid_info,
                 collider_static_config=collider_static_config,
                 sdf_info=sdf_info,
                 pos_world=pos_world,
@@ -389,7 +361,7 @@ class LegacyCoupler(RBC):
                 if qd.static(self.options.rod_gripper_contact_stiffness > 0):
                     vel = self._func_compliant_rod_gripper_contact(
                         i, pos_world, vel, mass, normal_rigid, signed_dist, geom_idx,
-                        batch_idx, geoms_info, links_state, rigid_global_info,
+                        batch_idx, geoms_info, links_state, rigid_info,
                     )
             else:
                 vel = self._func_collide_in_rigid_geom_rod(
@@ -403,7 +375,7 @@ class LegacyCoupler(RBC):
                     batch_idx,
                     geoms_info,
                     links_state,
-                    rigid_global_info,
+                    rigid_info,
                 )
 
             # Compliant gripper contact already resolves penetration through
@@ -418,10 +390,19 @@ class LegacyCoupler(RBC):
         return vel
 
     @qd.func
+    def _func_rod_link_excluded(self, i_v, i_b, link_idx):
+        """1 if rod vertex `i_v` ignores legacy coupling with `link_idx` (its own attachment neighbourhood)."""
+        excluded = 0
+        if qd.static(self._rod_link_exclusion):
+            if self.rod_solver._func_attached_link_excluded(i_v, i_b, link_idx):
+                excluded = 1
+        return excluded
+
+    @qd.func
     def _func_compliant_rod_gripper_contact(
         self, vertex_idx, pos_world, vel, mass, normal, signed_dist, geom_idx, batch_idx,
         geoms_info: array_class.GeomsInfo, links_state: array_class.LinksState,
-        rigid_global_info: array_class.RigidGlobalInfo,
+        rigid_info: array_class.RigidInfo,
     ):
         # A normal spring provides grip pressure even with zero normal speed.
         # A tangential spring retains static friction across rod projection.
@@ -437,7 +418,7 @@ class LegacyCoupler(RBC):
             tangent_vel = relative_vel - normal_vel * normal
             stiffness = self.options.rod_gripper_contact_stiffness
             damping = 2 * self.options.rod_gripper_contact_damping_ratio * qd.sqrt(stiffness * mass)
-            dt = rigid_global_info.substep_dt[None]
+            dt = rigid_info.substep_dt[None]
             normal_impulse = qd.max(0.0, (-stiffness * signed_dist - damping * normal_vel) * dt)
             link_idx = geoms_info.link_idx[geom_idx]
             link_pos = links_state.pos[link_idx, batch_idx]
@@ -469,9 +450,7 @@ class LegacyCoupler(RBC):
             )
             impulse = normal_impulse * normal + tangent_force * dt
             vel += impulse / mass
-            self.rigid_solver._func_apply_coupling_force(
-                pos_world, -impulse / dt, geoms_info.link_idx[geom_idx], batch_idx, links_state,
-            )
+            self.rigid_solver._func_apply_coupling_force(geoms_info.link_idx[geom_idx], batch_idx, pos_world, -impulse / dt, links_state)
         return vel
 
     @qd.func
@@ -486,17 +465,14 @@ class LegacyCoupler(RBC):
         i_b,
         geoms_info: array_class.GeomsInfo,
         links_state: array_class.LinksState,
-        rigid_global_info: array_class.RigidGlobalInfo,
+        rigid_info: array_class.RigidInfo,
     ):
         """
         Resolves collision when a particle is already in collision with a rigid object.
         This function assumes known normal_rigid and influence.
         """
         vel_rigid = self.rigid_solver._func_vel_at_point(
-            pos_world=pos_world,
-            link_idx=geoms_info.link_idx[geom_idx],
-            i_b=i_b,
-            links_state=links_state,
+            pos_world=pos_world, link_idx=geoms_info.link_idx[geom_idx], i_b=i_b, links_state=links_state
         )
 
         # v w.r.t rigid
@@ -529,13 +505,9 @@ class LegacyCoupler(RBC):
             #################### particle -> rigid ####################
             # Compute delta momentum and apply to rigid body.
             delta_mv = mass * (vel - vel_old)
-            force = -delta_mv / rigid_global_info.substep_dt[None]
+            force = -delta_mv / rigid_info.substep_dt[None]
             self.rigid_solver._func_apply_coupling_force(
-                pos_world,
-                force,
-                geoms_info.link_idx[geom_idx],
-                i_b,
-                links_state,
+                geoms_info.link_idx[geom_idx], i_b, pos_world, force, links_state
             )
 
         return vel
@@ -554,7 +526,7 @@ class LegacyCoupler(RBC):
         i_b,
         geoms_info: array_class.GeomsInfo,
         links_state: array_class.LinksState,
-        rigid_global_info: array_class.RigidGlobalInfo,
+        rigid_info: array_class.RigidInfo,
     ):
         vel_rigid = self.rigid_solver._func_vel_at_point(
             pos_world=pos_world,
@@ -602,14 +574,8 @@ class LegacyCoupler(RBC):
             #################### particle -> rigid ####################
             # Compute delta momentum and apply to rigid body.
             delta_mv = mass * (vel - vel_old)
-            force = -delta_mv / rigid_global_info.substep_dt[None]
-            self.rigid_solver._func_apply_coupling_force(
-                pos_world,
-                force,
-                geoms_info.link_idx[geom_idx],
-                i_b,
-                links_state,
-            )
+            force = -delta_mv / rigid_info.substep_dt[None]
+            self.rigid_solver._func_apply_coupling_force(geoms_info.link_idx[geom_idx], i_b, pos_world, force, links_state)
 
         return vel
 
@@ -623,10 +589,10 @@ class LegacyCoupler(RBC):
     @qd.func
     def _func_mpm_surface_normal(self, f, pos, i_b):
         # find the base grid node for the given position
-        mpm_base = qd.floor(pos * self.mpm_solver.inv_dx - 0.5).cast(gs.ti_int)
+        mpm_base = qd.floor(pos * self.mpm_solver.inv_dx - 0.5).cast(gs.qd_int)
 
         # calculate the mass gradient using central differences
-        mass_grad = qd.Vector.zero(gs.ti_float, 3)
+        mass_grad = qd.Vector.zero(gs.qd_float, 3)
         for d in qd.static(range(3)):
             p_node = mpm_base - self.mpm_solver.grid_offset
             n_node = mpm_base - self.mpm_solver.grid_offset
@@ -756,7 +722,7 @@ class LegacyCoupler(RBC):
         geoms_state: array_class.GeomsState,
         geoms_info: array_class.GeomsInfo,
         links_state: array_class.LinksState,
-        rigid_global_info: array_class.RigidGlobalInfo,
+        rigid_info: array_class.RigidInfo,
         sdf_info: array_class.SDFInfo,
         collider_static_config: qd.template(),
     ):
@@ -792,7 +758,7 @@ class LegacyCoupler(RBC):
                         geoms_state=geoms_state,
                         geoms_info=geoms_info,
                         links_state=links_state,
-                        rigid_global_info=rigid_global_info,
+                        rigid_info=rigid_info,
                         sdf_info=sdf_info,
                         collider_static_config=collider_static_config,
                     )
@@ -906,7 +872,7 @@ class LegacyCoupler(RBC):
         geoms_state: array_class.GeomsState,
         geoms_info: array_class.GeomsInfo,
         sdf_info: array_class.SDFInfo,
-        rigid_global_info: array_class.RigidGlobalInfo,
+        rigid_info: array_class.RigidInfo,
         collider_static_config: qd.template(),
     ):
         for i_p, i_b in qd.ndrange(self.mpm_solver.n_particles, self.mpm_solver._B):
@@ -914,14 +880,14 @@ class LegacyCoupler(RBC):
                 for i_g in range(self.rigid_solver.n_geoms):
                     if geoms_info.needs_coup[i_g]:
                         sdf_normal = sdf.sdf_func_normal_world(
-                            geoms_state=geoms_state,
-                            geoms_info=geoms_info,
-                            rigid_global_info=rigid_global_info,
-                            collider_static_config=collider_static_config,
-                            sdf_info=sdf_info,
-                            pos_world=self.mpm_solver.particles[f, i_p, i_b].pos,
-                            geom_idx=i_g,
-                            batch_idx=i_b,
+                            i_g,
+                            i_b,
+                            self.mpm_solver.particles[f, i_p, i_b].pos,
+                            geoms_state,
+                            geoms_info,
+                            rigid_info,
+                            sdf_info,
+                            collider_static_config,
                         )
                         # we only update the normal if the particle does not the object
                         if sdf_normal.dot(self.mpm_rigid_normal[i_p, i_g, i_b]) >= 0:
@@ -929,7 +895,7 @@ class LegacyCoupler(RBC):
 
     def fem_rigid_link_constraints(self):
         if self.fem_solver._constraints_initialized and self.rigid_solver.is_active:
-            self.fem_solver._kernel_update_linked_vertex_constraints(self.rigid_solver.links_state)
+            self.fem_solver._kernel_update_linked_vertex_constraints(self.rigid_solver.dyn_state.links)
 
     @qd.kernel
     def fem_surface_force(
@@ -938,7 +904,7 @@ class LegacyCoupler(RBC):
         geoms_state: array_class.GeomsState,
         geoms_info: array_class.GeomsInfo,
         links_state: array_class.LinksState,
-        rigid_global_info: array_class.RigidGlobalInfo,
+        rigid_info: array_class.RigidInfo,
         sdf_info: array_class.SDFInfo,
         collider_static_config: qd.template(),
     ):
@@ -971,7 +937,7 @@ class LegacyCoupler(RBC):
                             geoms_state,
                             geoms_info,
                             links_state,
-                            rigid_global_info,
+                            rigid_info,
                             sdf_info,
                             collider_static_config,
                         )
@@ -1138,7 +1104,7 @@ class LegacyCoupler(RBC):
         geoms_state: array_class.GeomsState,
         geoms_info: array_class.GeomsInfo,
         links_state: array_class.LinksState,
-        rigid_global_info: array_class.RigidGlobalInfo,
+        rigid_info: array_class.RigidInfo,
         sdf_info: array_class.SDFInfo,
         collider_static_config: qd.template(),
     ):
@@ -1153,7 +1119,11 @@ class LegacyCoupler(RBC):
                 velocity_before_contacts = self.rod_solver.vertices[f + 1, i_v, i_b].vel
                 pressure_delta = qd.Vector.zero(gs.qd_float, 3)
                 for i_g in qd.ndrange(self.rigid_solver.n_geoms):
-                    if geoms_info.needs_coup[i_g]:
+                    excluded = self._func_rod_link_excluded(i_v, i_b, geoms_info.link_idx[i_g])
+                    if qd.static(self._rod_link_exclusion and self.options.rod_gripper_contact_stiffness > 0):
+                        if excluded:
+                            self._rod_grip_active[i_v, i_g, i_b] = False
+                    if geoms_info.needs_coup[i_g] and not excluded:
                         pressure_contact = False
                         source_velocity = self.rod_solver.vertices[f + 1, i_v, i_b].vel
                         if qd.static(self.options.rod_gripper_contact_stiffness > 0):
@@ -1175,7 +1145,7 @@ class LegacyCoupler(RBC):
                             geoms_state,
                             geoms_info,
                             links_state,
-                            rigid_global_info,
+                            rigid_info,
                             sdf_info,
                             collider_static_config,
                         )
@@ -1189,7 +1159,7 @@ class LegacyCoupler(RBC):
                                 self._rod_contact_positions[contact_slot, i_v, i_g, i_b] = position
                                 self._rod_contact_normals[contact_slot, i_v, i_g, i_b] = sdf.sdf_func_normal_world(
                                     geoms_state=geoms_state, geoms_info=geoms_info,
-                                    rigid_global_info=rigid_global_info,
+                                    rigid_info=rigid_info,
                                     collider_static_config=collider_static_config, sdf_info=sdf_info,
                                     pos_world=position, geom_idx=i_g, batch_idx=i_b,
                                 )
@@ -1221,7 +1191,7 @@ class LegacyCoupler(RBC):
         geoms_info: array_class.GeomsInfo,
         links_state: array_class.LinksState,
         links_info: array_class.LinksInfo,
-        rigid_global_info: array_class.RigidGlobalInfo,
+        rigid_info: array_class.RigidInfo,
         sdf_info: array_class.SDFInfo,
         collider_static_config: qd.template(),
         rigid_static_config: qd.template(),
@@ -1237,6 +1207,7 @@ class LegacyCoupler(RBC):
                 and geoms_info.needs_coup[i_g]
                 and self.rod_rigid_gripper_geom_indices[i_g, i_b] >= -1
                 and constraint.link_idx != geoms_info.link_idx[i_g]
+                and not self._func_rod_link_excluded(i_v, i_b, geoms_info.link_idx[i_g])
             ):
                 pos = self.rod_solver.vertices[f, i_v, i_b].vert
                 radius = self.rod_solver.vertices_param[i_v, i_b].radius
@@ -1247,16 +1218,12 @@ class LegacyCoupler(RBC):
                 if signed_dist < 0:
                     normal = sdf.sdf_func_normal_world(
                         geoms_state=geoms_state, geoms_info=geoms_info,
-                        rigid_global_info=rigid_global_info,
+                        rigid_info=rigid_info,
                         collider_static_config=collider_static_config, sdf_info=sdf_info,
                         pos_world=pos, geom_idx=i_g, batch_idx=i_b,
                     )
-                    attached_vel = self.rigid_solver._func_vel_at_point(
-                        pos, constraint.link_idx, i_b, links_state
-                    )
-                    rigid_vel = self.rigid_solver._func_vel_at_point(
-                        pos, geoms_info.link_idx[i_g], i_b, links_state
-                    )
+                    attached_vel = self.rigid_solver._func_vel_at_point(constraint.link_idx, i_b, pos, links_state)
+                    rigid_vel = self.rigid_solver._func_vel_at_point(geoms_info.link_idx[i_g], i_b, pos, links_state)
                     attachment_I = (
                         [constraint.link_idx, i_b]
                         if qd.static(rigid_static_config.batch_links_info)
@@ -1281,17 +1248,13 @@ class LegacyCoupler(RBC):
                         mass = 1.0 / inverse_mass
                     stiffness = self.options.rod_gripper_contact_stiffness
                     damping = 2 * self.options.rod_gripper_contact_damping_ratio * qd.sqrt(stiffness * mass)
-                    dt = rigid_global_info.substep_dt[None]
+                    dt = rigid_info.substep_dt[None]
                     impulse = qd.max(
                         0.0, (-stiffness * signed_dist - damping * (attached_vel - rigid_vel).dot(normal)) * dt
                     ) * normal
                     if impulse.dot(impulse) > 0:
-                        self.rigid_solver._func_apply_coupling_force(
-                            pos, impulse / dt, constraint.link_idx, i_b, links_state
-                        )
-                        self.rigid_solver._func_apply_coupling_force(
-                            pos, -impulse / dt, geoms_info.link_idx[i_g], i_b, links_state
-                        )
+                        self.rigid_solver._func_apply_coupling_force(constraint.link_idx, i_b, pos, impulse / dt, links_state)
+                        self.rigid_solver._func_apply_coupling_force(geoms_info.link_idx[i_g], i_b, pos, -impulse / dt, links_state)
                         if qd.static(self.options.record_rod_contacts):
                             self._rod_contact_impulses[contact_slot, i_v, i_g, i_b] = impulse
                             self._rod_contact_positions[contact_slot, i_v, i_g, i_b] = pos
@@ -1312,7 +1275,7 @@ class LegacyCoupler(RBC):
         geoms_info: array_class.GeomsInfo,
         links_state: array_class.LinksState,
         links_info: array_class.LinksInfo,
-        rigid_global_info: array_class.RigidGlobalInfo,
+        rigid_info: array_class.RigidInfo,
         sdf_info: array_class.SDFInfo,
         collider_static_config: qd.template(),
         rigid_static_config: qd.template(),
@@ -1346,22 +1309,23 @@ class LegacyCoupler(RBC):
                     and constraint0.link_idx == collider_link
                     and constraint1.link_idx == collider_link
                 )
+                excluded = (
+                    self._func_rod_link_excluded(v0, i_b, collider_link)
+                    or self._func_rod_link_excluded(v1, i_b, collider_link)
+                )
                 if (
                     (free0 or free1 or constraint0.link_idx >= 0 or constraint1.link_idx >= 0)
                     and not fully_attached_to_collider
+                    and not excluded
                 ):
                     p0 = self.rod_solver.vertices[f, v0, i_b].vert
                     p1 = self.rod_solver.vertices[f, v1, i_b].vert
                     vel0 = self._rod_edge_velocity_source[v0, i_b]
                     vel1 = self._rod_edge_velocity_source[v1, i_b]
                     if constraint0.constrained and constraint0.link_idx >= 0:
-                        vel0 = self.rigid_solver._func_vel_at_point(
-                            p0, constraint0.link_idx, i_b, links_state
-                        )
+                        vel0 = self.rigid_solver._func_vel_at_point(constraint0.link_idx, i_b, p0, links_state)
                     if constraint1.constrained and constraint1.link_idx >= 0:
-                        vel1 = self.rigid_solver._func_vel_at_point(
-                            p1, constraint1.link_idx, i_b, links_state
-                        )
+                        vel1 = self.rigid_solver._func_vel_at_point(constraint1.link_idx, i_b, p1, links_state)
                     mass0 = self.rod_solver.vertices_param[v0, i_b].mass
                     mass1 = self.rod_solver.vertices_param[v1, i_b].mass
                     radius = qd.max(
@@ -1396,7 +1360,7 @@ class LegacyCoupler(RBC):
                                 normal = sdf.sdf_func_normal_world(
                                     geoms_state=geoms_state,
                                     geoms_info=geoms_info,
-                                    rigid_global_info=rigid_global_info,
+                                    rigid_info=rigid_info,
                                     collider_static_config=collider_static_config,
                                     sdf_info=sdf_info,
                                     pos_world=pos,
@@ -1462,24 +1426,18 @@ class LegacyCoupler(RBC):
                                 if inverse_sample_mass > 0:
                                     sample_mass = 1.0 / (inverse_sample_mass * qd.cast(n_intervals, gs.qd_float))
                                 damping = 2 * self.options.rod_gripper_contact_damping_ratio * qd.sqrt(stiffness * sample_mass)
-                                dt = rigid_global_info.substep_dt[None]
+                                dt = rigid_info.substep_dt[None]
                                 impulse = qd.max(0.0, (-stiffness * signed_dist - damping * normal_vel) * dt) * normal
                                 if impulse.dot(impulse) > 0:
                                     if free0:
                                         delta0 += w0 * impulse / mass0
                                     elif constraint0.link_idx >= 0:
-                                        self.rigid_solver._func_apply_coupling_force(
-                                            p0, w0 * impulse / dt, constraint0.link_idx, i_b, links_state
-                                        )
+                                        self.rigid_solver._func_apply_coupling_force(constraint0.link_idx, i_b, p0, w0 * impulse / dt, links_state)
                                     if free1:
                                         delta1 += w1 * impulse / mass1
                                     elif constraint1.link_idx >= 0:
-                                        self.rigid_solver._func_apply_coupling_force(
-                                            p1, w1 * impulse / dt, constraint1.link_idx, i_b, links_state
-                                        )
-                                    self.rigid_solver._func_apply_coupling_force(
-                                        pos, -impulse / dt, geoms_info.link_idx[i_g], i_b, links_state
-                                    )
+                                        self.rigid_solver._func_apply_coupling_force(constraint1.link_idx, i_b, p1, w1 * impulse / dt, links_state)
+                                    self.rigid_solver._func_apply_coupling_force(geoms_info.link_idx[i_g], i_b, pos, -impulse / dt, links_state)
                                     recorded_impulse += impulse
                                     load = impulse.norm(gs.EPS)
                                     recorded_load += load
@@ -1500,13 +1458,13 @@ class LegacyCoupler(RBC):
 
     def rod_rigid_link_constraints(self, f):
         if self.rigid_solver.is_active:
-            self.rod_solver._kernel_update_attached_verts(self.rigid_solver.links_state)
+            self.rod_solver._kernel_update_attached_verts(self.rigid_solver.dyn_state.links)
             if self.rod_solver._two_way_attachment_forces:
                 self.rod_rigid_apply_attached_vertex_forces(
                     f,
-                    self.rigid_solver.links_state,
-                    self.rigid_solver.links_info,
-                    self.rigid_solver._static_rigid_sim_config,
+                    self.rigid_solver.dyn_state.links,
+                    self.rigid_solver.dyn_info.links,
+                    self.rigid_solver.rigid_config,
                 )
 
     @qd.kernel
@@ -1533,17 +1491,11 @@ class LegacyCoupler(RBC):
                 # inertias can be very small, so a seemingly modest force can
                 # otherwise immediately destabilize the rigid solver.
                 I_l = [constraint.link_idx, i_b] if qd.static(static_rigid_sim_config.batch_links_info) else constraint.link_idx
-                mass = links_info.inertial_mass[I_l] + links_state.mass_shift[constraint.link_idx, i_b]
+                mass = links_info.inertial_mass[I_l]
                 acceleration_limit = 0.5 * mass * self.rod_solver._two_way_attachment_max_acceleration
                 limit = qd.min(self.rod_solver._two_way_attachment_force_limit, acceleration_limit)
                 rod_force = rod_force * qd.min(1.0, limit / magnitude)
-                self.rigid_solver._func_apply_coupling_force(
-                    self.rod_solver.vertices[f, i_v, i_b].vert,
-                    rod_force,
-                    constraint.link_idx,
-                    i_b,
-                    links_state,
-                )
+                self.rigid_solver._func_apply_coupling_force(constraint.link_idx, i_b, self.rod_solver.vertices[f, i_v, i_b].vert, rod_force, links_state)
 
     @qd.kernel
     def init_rod_rigid_gripper_geom_indices(self, n_geoms: qd.i32, geom_indices: qd.types.ndarray()):
@@ -1579,7 +1531,8 @@ class LegacyCoupler(RBC):
         geoms_state: array_class.GeomsState,
         geoms_info: array_class.GeomsInfo,
         links_state: array_class.LinksState,
-        rigid_global_info: array_class.RigidGlobalInfo,
+        links_info: array_class.LinksInfo,
+        rigid_info: array_class.RigidInfo,
         sdf_info: array_class.SDFInfo,
         collider_static_config: qd.template(),
     ):
@@ -1594,13 +1547,15 @@ class LegacyCoupler(RBC):
                             self.sph_solver.particles_reordered[i_p, i_b].pos,
                             self.sph_solver.particles_reordered[i_p, i_b].vel,
                             self.sph_solver.particles_info_reordered[i_p, i_b].mass,
+                            self.sph_solver.particles_reordered[i_p, i_b].p,
                             self.sph_rigid_normal_reordered[i_p, i_g, i_b],
                             i_g,
                             i_b,
                             geoms_state,
                             geoms_info,
                             links_state,
-                            rigid_global_info,
+                            links_info,
+                            rigid_info,
                             sdf_info,
                             collider_static_config,
                         )
@@ -1612,7 +1567,7 @@ class LegacyCoupler(RBC):
         geoms_info: array_class.GeomsInfo,
         links_state: array_class.LinksState,
         sdf_info: array_class.SDFInfo,
-        rigid_global_info: array_class.RigidGlobalInfo,
+        rigid_info: array_class.RigidInfo,
         collider_static_config: qd.template(),
     ):
         for i_p, i_b in qd.ndrange(self.pbd_solver._n_particles, self.sph_solver._B):
@@ -1636,17 +1591,13 @@ class LegacyCoupler(RBC):
                             geoms_info,
                             links_state,
                             sdf_info,
-                            rigid_global_info,
+                            rigid_info,
                             collider_static_config,
                         )
 
     @qd.kernel
     def kernel_attach_pbd_to_rigid_link(
-        self,
-        particles_idx: qd.types.ndarray(),
-        envs_idx: qd.types.ndarray(),
-        link_idx: qd.i32,
-        links_state: LinksState,
+        self, particles_idx: qd.types.ndarray(), envs_idx: qd.types.ndarray(), link_idx: qd.i32, links_state: LinksState
     ) -> None:
         """
         Sets listed particles in listed environments to be animated by the link.
@@ -1672,9 +1623,7 @@ class LegacyCoupler(RBC):
 
     @qd.kernel
     def kernel_pbd_rigid_clear_animate_particles_by_link(
-        self,
-        particles_idx: qd.types.ndarray(),
-        envs_idx: qd.types.ndarray(),
+        self, particles_idx: qd.types.ndarray(), envs_idx: qd.types.ndarray()
     ) -> None:
         """Detach listed particles from links, and simulate them freely."""
         pdb = self.pbd_solver
@@ -1738,30 +1687,16 @@ class LegacyCoupler(RBC):
         geoms_info: array_class.GeomsInfo,
         links_state: array_class.LinksState,
         sdf_info: array_class.SDFInfo,
-        rigid_global_info: array_class.RigidGlobalInfo,
+        rigid_info: array_class.RigidInfo,
         collider_static_config: qd.template(),
     ):
         """
         Resolves collision when a particle is already in collision with a rigid object.
         This function assumes known normal_rigid and influence.
         """
-        signed_dist = sdf.sdf_func_world(
-            geoms_state=geoms_state,
-            geoms_info=geoms_info,
-            sdf_info=sdf_info,
-            pos_world=pos_world,
-            geom_idx=geom_idx,
-            batch_idx=batch_idx,
-        )
+        signed_dist = sdf.sdf_func_world(geom_idx, batch_idx, pos_world, geoms_state, geoms_info, sdf_info)
         contact_normal = sdf.sdf_func_normal_world(
-            geoms_state=geoms_state,
-            geoms_info=geoms_info,
-            rigid_global_info=rigid_global_info,
-            collider_static_config=collider_static_config,
-            sdf_info=sdf_info,
-            pos_world=pos_world,
-            geom_idx=geom_idx,
-            batch_idx=batch_idx,
+            geom_idx, batch_idx, pos_world, geoms_state, geoms_info, rigid_info, sdf_info, collider_static_config
         )
         new_pos = pos_world
         new_vel = vel
@@ -1793,11 +1728,7 @@ class LegacyCoupler(RBC):
             force = (-delta_mv / self.rigid_solver._substep_dt) * (1 - energy_loss)
 
             self.rigid_solver._func_apply_coupling_force(
-                pos_world,
-                force,
-                geoms_info.link_idx[geom_idx],
-                batch_idx,
-                links_state,
+                geoms_info.link_idx[geom_idx], batch_idx, pos_world, force, links_state
             )
 
         return new_pos, new_vel, contact_normal
@@ -1807,11 +1738,11 @@ class LegacyCoupler(RBC):
         if self._rigid_mpm and self.mpm_solver.enable_CPIC:
             self.mpm_surface_to_particle(
                 f,
-                self.rigid_solver.geoms_state,
-                self.rigid_solver.geoms_info,
+                self.rigid_solver.dyn_state.geoms,
+                self.rigid_solver.dyn_info.geoms,
                 self.rigid_solver.collider._sdf._sdf_info,
-                self.rigid_solver._rigid_global_info,
-                self.rigid_solver.collider._collider_static_config,
+                self.rigid_solver.rigid_info,
+                self.rigid_solver.collider.collider_config,
             )
 
     def couple(self, f):
@@ -1820,92 +1751,96 @@ class LegacyCoupler(RBC):
             self.mpm_grid_op(
                 f,
                 self.sim.cur_t,
-                geoms_state=self.rigid_solver.geoms_state,
-                geoms_info=self.rigid_solver.geoms_info,
-                links_state=self.rigid_solver.links_state,
-                rigid_global_info=self.rigid_solver._rigid_global_info,
+                geoms_state=self.rigid_solver.dyn_state.geoms,
+                geoms_info=self.rigid_solver.dyn_info.geoms,
+                links_state=self.rigid_solver.dyn_state.links,
+                rigid_info=self.rigid_solver.rigid_info,
                 sdf_info=self.rigid_solver.collider._sdf._sdf_info,
-                collider_static_config=self.rigid_solver.collider._collider_static_config,
+                collider_static_config=self.rigid_solver.collider.collider_config,
             )
 
         # SPH <-> Rigid
         if self._rigid_sph:
             self.sph_rigid(
                 f,
-                self.rigid_solver.geoms_state,
-                self.rigid_solver.geoms_info,
-                self.rigid_solver.links_state,
-                self.rigid_solver._rigid_global_info,
+                self.rigid_solver.dyn_state.geoms,
+                self.rigid_solver.dyn_info.geoms,
+                self.rigid_solver.dyn_state.links,
+                self.rigid_solver.dyn_info.links,
+                self.rigid_solver.rigid_info,
                 self.rigid_solver.collider._sdf._sdf_info,
-                self.rigid_solver.collider._collider_static_config,
+                self.rigid_solver.collider.collider_config,
             )
 
         # PBD <-> Rigid
         if self._rigid_pbd:
             self.kernel_pbd_rigid_collide(
-                geoms_state=self.rigid_solver.geoms_state,
-                geoms_info=self.rigid_solver.geoms_info,
-                links_state=self.rigid_solver.links_state,
+                geoms_state=self.rigid_solver.dyn_state.geoms,
+                geoms_info=self.rigid_solver.dyn_info.geoms,
+                links_state=self.rigid_solver.dyn_state.links,
                 sdf_info=self.rigid_solver.collider._sdf._sdf_info,
-                rigid_global_info=self.rigid_solver._rigid_global_info,
-                collider_static_config=self.rigid_solver.collider._collider_static_config,
+                rigid_info=self.rigid_solver.rigid_info,
+                collider_static_config=self.rigid_solver.collider.collider_config,
             )
 
-            # 1-way: animate particles by links
-            full_step_inv_dt = 1.0 / self.pbd_solver._dt
-            clamped_inv_dt = min(full_step_inv_dt, CLAMPED_INV_DT)
-            self.kernel_pbd_rigid_solve_animate_particles_by_link(clamped_inv_dt, self.rigid_solver.links_state)
+            # 1-way: animate particles by links, over the substep interval and no faster than the clamp allows.
+            substep_inv_dt = 1.0 / self.pbd_solver.substep_dt
+            clamped_inv_dt = min(substep_inv_dt, CLAMPED_INV_DT)
+            self.kernel_pbd_rigid_solve_animate_particles_by_link(clamped_inv_dt, self.rigid_solver.dyn_state.links)
 
         if self.fem_solver.is_active:
             self.fem_surface_force(
                 f,
-                self.rigid_solver.geoms_state,
-                self.rigid_solver.geoms_info,
-                self.rigid_solver.links_state,
-                self.rigid_solver._rigid_global_info,
+                self.rigid_solver.dyn_state.geoms,
+                self.rigid_solver.dyn_info.geoms,
+                self.rigid_solver.dyn_state.links,
+                self.rigid_solver.rigid_info,
                 self.rigid_solver.collider._sdf._sdf_info,
-                self.rigid_solver.collider._collider_static_config,
+                self.rigid_solver.collider.collider_config,
             )
             self.fem_rigid_link_constraints()
 
         # Rod <-> Rigid
         if self._rigid_rod:
+            if self._rod_link_exclusion:
+                # Attachments can change between steps (attach/detach APIs): refresh every substep (cheap).
+                self.rod_solver._kernel_update_attached_link_exclusion()
             self.clear_rod_rigid_gripper_geom_indices()
             self.rod_vertex_force(
                 f,
                 self.sim.cur_substep_global % self.sim.substeps,
-                self.rigid_solver.geoms_state,
-                self.rigid_solver.geoms_info,
-                self.rigid_solver.links_state,
-                self.rigid_solver._rigid_global_info,
+                self.rigid_solver.dyn_state.geoms,
+                self.rigid_solver.dyn_info.geoms,
+                self.rigid_solver.dyn_state.links,
+                self.rigid_solver.rigid_info,
                 self.rigid_solver.collider._sdf._sdf_info,
-                self.rigid_solver.collider._collider_static_config,
+                self.rigid_solver.collider.collider_config,
             )
             if self.options.rod_gripper_contact_stiffness > 0:
                 self.rod_constrained_vertex_gripper_force(
                     f,
                     self.sim.cur_substep_global % self.sim.substeps,
-                    self.rigid_solver.geoms_state,
-                    self.rigid_solver.geoms_info,
-                    self.rigid_solver.links_state,
-                    self.rigid_solver.links_info,
-                    self.rigid_solver._rigid_global_info,
+                    self.rigid_solver.dyn_state.geoms,
+                    self.rigid_solver.dyn_info.geoms,
+                    self.rigid_solver.dyn_state.links,
+                    self.rigid_solver.dyn_info.links,
+                    self.rigid_solver.rigid_info,
                     self.rigid_solver.collider._sdf._sdf_info,
-                    self.rigid_solver.collider._collider_static_config,
-                    self.rigid_solver._static_rigid_sim_config,
+                    self.rigid_solver.collider.collider_config,
+                    self.rigid_solver.rigid_config,
                 )
                 self.prepare_rod_edge_gripper_force(f)
                 self.rod_edge_gripper_force(
                     f,
                     self.sim.cur_substep_global % self.sim.substeps,
-                    self.rigid_solver.geoms_state,
-                    self.rigid_solver.geoms_info,
-                    self.rigid_solver.links_state,
-                    self.rigid_solver.links_info,
-                    self.rigid_solver._rigid_global_info,
+                    self.rigid_solver.dyn_state.geoms,
+                    self.rigid_solver.dyn_info.geoms,
+                    self.rigid_solver.dyn_state.links,
+                    self.rigid_solver.dyn_info.links,
+                    self.rigid_solver.rigid_info,
                     self.rigid_solver.collider._sdf._sdf_info,
-                    self.rigid_solver.collider._collider_static_config,
-                    self.rigid_solver._static_rigid_sim_config,
+                    self.rigid_solver.collider.collider_config,
+                    self.rigid_solver.rigid_config,
                 )
                 self.apply_rod_edge_gripper_force(f)
             self.rod_rigid_link_constraints(f)
@@ -1914,34 +1849,23 @@ class LegacyCoupler(RBC):
         if self.fem_solver.is_active:
             self.fem_surface_force.grad(
                 f,
-                self.rigid_solver.geoms_state,
-                self.rigid_solver.geoms_info,
-                self.rigid_solver.links_state,
-                self.rigid_solver._rigid_global_info,
+                self.rigid_solver.dyn_state.geoms,
+                self.rigid_solver.dyn_info.geoms,
+                self.rigid_solver.dyn_state.links,
+                self.rigid_solver.rigid_info,
                 self.rigid_solver.collider._sdf._sdf_info,
-                self.rigid_solver.collider._collider_static_config,
+                self.rigid_solver.collider.collider_config,
             )
         if self.mpm_solver.is_active:
             self.mpm_grid_op.grad(
                 f,
                 self.sim.cur_t,
-                geoms_state=self.rigid_solver.geoms_state,
-                geoms_info=self.rigid_solver.geoms_info,
-                links_state=self.rigid_solver.links_state,
-                rigid_global_info=self.rigid_solver._rigid_global_info,
+                geoms_state=self.rigid_solver.dyn_state.geoms,
+                geoms_info=self.rigid_solver.dyn_info.geoms,
+                links_state=self.rigid_solver.dyn_state.links,
+                rigid_info=self.rigid_solver.rigid_info,
                 sdf_info=self.rigid_solver.collider._sdf._sdf_info,
-                collider_static_config=self.rigid_solver.collider._collider_static_config,
-            )
-        if self.mpm_solver.is_active:
-            self.mpm_grid_op.grad(
-                f,
-                self.sim.cur_t,
-                geoms_state=self.rigid_solver.geoms_state,
-                geoms_info=self.rigid_solver.geoms_info,
-                links_state=self.rigid_solver.links_state,
-                rigid_global_info=self.rigid_solver._rigid_global_info,
-                sdf_info=self.rigid_solver.collider._sdf._sdf_info,
-                collider_static_config=self.rigid_solver.collider._collider_static_config,
+                collider_static_config=self.rigid_solver.collider.collider_config,
             )
 
     @property

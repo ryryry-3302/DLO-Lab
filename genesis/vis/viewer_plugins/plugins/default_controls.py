@@ -1,7 +1,5 @@
-import os
 from typing import TYPE_CHECKING
 
-import genesis as gs
 from genesis.vis.keybindings import Key, Keybind
 
 from ..base import ViewerPlugin
@@ -24,9 +22,22 @@ class DefaultControlsPlugin(ViewerPlugin):
     def build(self, viewer, camera: "Node", scene: "Scene"):
         super().build(viewer, camera, scene)
 
+        keybinds = []
+
+        # Both shortcuts prompt for a destination through 'imgui-bundle', an optional dependency, and come first to
+        # keep the on-screen help order.
+        try:
+            import imgui_bundle  # noqa: F401
+
+            keybinds += [
+                Keybind("record_video", Key.R, callback=self._toggle_record_video, allow_overload=True),
+                Keybind("save_image", Key.S, callback=self._save_image, allow_overload=True),
+            ]
+        except ImportError:
+            pass
+
         self.viewer.register_keybinds(
-            Keybind("record_video", Key.R, callback=self._toggle_record_video, allow_overload=True),
-            Keybind("save_image", Key.S, callback=self._save_image, allow_overload=True),
+            *keybinds,
             Keybind("reset_camera", Key.Z, callback=self._reset_camera, allow_overload=True),
             Keybind("camera_rotation", Key.A, callback=self._toggle_cam_rotation, allow_overload=True),
             Keybind("shadow", Key.H, callback=self._toggle_shadow, allow_overload=True),
@@ -103,20 +114,7 @@ class DefaultControlsPlugin(ViewerPlugin):
             self.viewer.set_message_text("Vert Normals Off")
 
     def _toggle_record_video(self):
-        if self.viewer.viewer_flags["record"]:
-            self.viewer.save_video()
-            self.viewer.set_caption(self.viewer.viewer_flags["window_title"])
-        else:
-            # Importing moviepy is very slow and not used very often. Let's delay import.
-            from moviepy.video.io.ffmpeg_writer import FFMPEG_VideoWriter
-
-            self.viewer._video_recorder = FFMPEG_VideoWriter(
-                filename=os.path.join(gs.utils.misc.get_cache_dir(), "tmp_video.mp4"),
-                fps=self.viewer.viewer_flags["refresh_rate"],
-                size=self.viewer.viewport_size,
-            )
-            self.viewer.set_caption("{} (RECORDING)".format(self.viewer.viewer_flags["window_title"]))
-        self.viewer.viewer_flags["record"] = not self.viewer.viewer_flags["record"]
+        self.viewer.toggle_recording()
 
     def _save_image(self):
         self.viewer._save_image()

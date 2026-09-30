@@ -10,11 +10,12 @@ import genesis.utils.geom as gu
 import genesis.utils.sdf as sdf
 from genesis.engine.boundaries import CubeBoundary
 from genesis.engine.entities import MPMEntity
+from genesis.engine.materials import MPM
 from genesis.engine.states.solvers import MPMSolverState
 from genesis.options.solvers import MPMOptions
 from genesis.utils.misc import DeprecationError, qd_to_torch
 
-from .base_solver import Solver
+from .base_solver import GravityMixin, Solver, TimeBasedMixin
 
 if TYPE_CHECKING:
     from genesis.engine.entities import MPMEntity
@@ -24,7 +25,8 @@ if TYPE_CHECKING:
 
 
 @qd.data_oriented
-class MPMSolver(Solver):
+class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
+    material_cls = MPM.Base
     # ------------------------------------------------------------------------------------
     # --------------------------------- Initialization -----------------------------------
     # ------------------------------------------------------------------------------------
@@ -40,7 +42,7 @@ class MPMSolver(Solver):
         self._enable_CPIC = options.enable_CPIC
         self._constraints_initialized = False
 
-        self._n_vvert_supports = self.scene.vis_options.n_support_neighbors
+        self._n_vvert_supports = self.scene.options.vis.n_support_neighbors
 
         # `_particle_volume_scale` is used to avoid potential numerical instability, as the actual `_particle_volume` may be very small.
         # Note that the magnitude of `_particle_volume` doesn't affect MPM simulation itself, but it is used to compute particle
@@ -75,8 +77,7 @@ class MPMSolver(Solver):
         # safety padding
         self.boundary_padding = 3 * self._dx
         self.boundary = CubeBoundary(
-            lower=self._lower_bound + self.boundary_padding,
-            upper=self._upper_bound - self.boundary_padding,
+            lower=self._lower_bound + self.boundary_padding, upper=self._upper_bound - self.boundary_padding
         )
 
     def init_particle_fields(self):
@@ -95,9 +96,7 @@ class MPMSolver(Solver):
         )
 
         # dynamic particle state without gradient
-        struct_particle_state_ng = qd.types.struct(
-            active=gs.qd_bool,
-        )
+        struct_particle_state_ng = qd.types.struct(active=gs.qd_bool)
 
         # static particle info
         struct_particle_info = qd.types.struct(
@@ -111,22 +110,14 @@ class MPMSolver(Solver):
         )
 
         # single frame particle state for rendering
-        struct_particle_state_render = qd.types.struct(
-            pos=gs.qd_vec3,
-            vel=gs.qd_vec3,
-            active=gs.qd_bool,
-        )
+        struct_particle_state_render = qd.types.struct(pos=gs.qd_vec3, vel=gs.qd_vec3, active=gs.qd_bool)
 
         # construct fields
         self.particles = struct_particle_state.field(
-            shape=(self._sim.substeps_local + 1, self._n_particles, self._B),
-            needs_grad=True,
-            layout=qd.Layout.SOA,
+            shape=(self._sim.substeps_local + 1, self._n_particles, self._B), needs_grad=True, layout=qd.Layout.SOA
         )
         self.particles_ng = struct_particle_state_ng.field(
-            shape=(self._sim.substeps_local + 1, self._n_particles, self._B),
-            needs_grad=False,
-            layout=qd.Layout.SOA,
+            shape=(self._sim.substeps_local + 1, self._n_particles, self._B), needs_grad=False, layout=qd.Layout.SOA
         )
         self.particles_info = struct_particle_info.field(
             shape=self._n_particles, needs_grad=False, layout=qd.Layout.SOA
@@ -144,9 +135,7 @@ class MPMSolver(Solver):
         # Grid is only ever indexed at [f] (never [f+1]) in p2g/g2p/reset/coupler, so substeps_local frames are enough.
         # Particles still need substeps_local + 1 because g2p writes the next-frame state at [f+1].
         self.grid = grid_cell_state.field(
-            shape=(self._sim.substeps_local, *self._grid_res, self._B),
-            needs_grad=True,
-            layout=qd.Layout.SOA,
+            shape=(self._sim.substeps_local, *self._grid_res, self._B), needs_grad=True, layout=qd.Layout.SOA
         )
 
         # Sparse-reset bookkeeping for forward-only mode. A single global dirty list captures unique cells touched by
@@ -171,10 +160,7 @@ class MPMSolver(Solver):
         )
         self.vverts_info = struct_vvert_info.field(shape=(max(1, self._n_vverts),), layout=qd.Layout.SOA)
 
-        struct_vvert_state_render = qd.types.struct(
-            pos=gs.qd_vec3,
-            active=gs.qd_bool,
-        )
+        struct_vvert_state_render = qd.types.struct(pos=gs.qd_vec3, active=gs.qd_bool)
         self.vverts_render = struct_vvert_state_render.field(
             shape=(max(1, self._n_vverts), self._B), layout=qd.Layout.SOA
         )
@@ -258,14 +244,8 @@ class MPMSolver(Solver):
                     "calculated based on `grid_density`). Simulation might be unstable."
                 )
 
-        # FIXME: _gravity must be a raw qd.field() because LegacyCoupler.mpm_grid_op accesses it via template attribute on a
-        # @qd.data_oriented class, and Quadrants doesn't support Ndarray attrs on data_oriented in kernel scope. Fix by either:
-        # (1) adding Ndarray support to data_oriented template resolution, or (2) migrating the solver to a frozen dataclass
-        # so _predeclare_struct_ndarrays can register the Ndarray.
-        if self._gravity is not None:
-            gravity = self._gravity.to_numpy()
-            self._gravity = qd.field(dtype=gs.qd_vec3, shape=(self._B,))
-            self._gravity.from_numpy(gravity)
+        # Kernels of this solver take the solver itself, so gravity has to be a field for them.
+        self._build_gravity(as_field=True)
 
     # ------------------------------------------------------------------------------------
     # -------------------------------------- misc ----------------------------------------
@@ -275,7 +255,9 @@ class MPMSolver(Solver):
     def is_active(self):
         return self.n_particles > 0
 
-    def add_entity(self, idx, material, morph, surface, name: str | None = None) -> "MPMEntity":
+    def add_entity(
+        self, idx, material, morph, surface, visualize_contact=False, name: str | None = None, desc=None
+    ) -> "MPMEntity":
         self.add_material(material)
 
         # create entity
@@ -378,7 +360,7 @@ class MPMSolver(Solver):
         geoms_state: array_class.GeomsState,
         geoms_info: array_class.GeomsInfo,
         links_state: array_class.LinksState,
-        rigid_global_info: array_class.RigidGlobalInfo,
+        rigid_info: array_class.RigidInfo,
         sdf_info: array_class.SDFInfo,
         collider_static_config: qd.template(),
     ):
@@ -454,14 +436,14 @@ class MPMSolver(Solver):
                             if geoms_info.needs_coup[i_g]:
                                 sdf_normal_particle = self._coupler.mpm_rigid_normal[i_p, i_g, i_b]
                                 sdf_normal_cell = sdf.sdf_func_normal_world(
-                                    geoms_state=geoms_state,
-                                    geoms_info=geoms_info,
-                                    rigid_global_info=rigid_global_info,
-                                    collider_static_config=collider_static_config,
-                                    sdf_info=sdf_info,
-                                    pos_world=cell_pos,
-                                    geom_idx=i_g,
-                                    batch_idx=i_b,
+                                    i_g,
+                                    i_b,
+                                    cell_pos,
+                                    geoms_state,
+                                    geoms_info,
+                                    rigid_info,
+                                    sdf_info,
+                                    collider_static_config,
                                 )
 
                                 if sdf_normal_particle.dot(sdf_normal_cell) < 0:  # separated by geom i_g
@@ -499,7 +481,7 @@ class MPMSolver(Solver):
         f: qd.i32,
         geoms_info: array_class.GeomsInfo,
         links_state: array_class.LinksState,
-        rigid_global_info: array_class.RigidGlobalInfo,
+        rigid_info: array_class.RigidInfo,
     ):
         for i_p, i_b in qd.ndrange(self._n_particles, self._B):
             if self.particles_ng[f, i_p, i_b].active:
@@ -528,7 +510,7 @@ class MPMSolver(Solver):
                                 i_b,
                                 geoms_info=geoms_info,
                                 links_state=links_state,
-                                rigid_global_info=rigid_global_info,
+                                rigid_info=rigid_info,
                             )
 
                     new_vel += weight * grid_vel
@@ -591,23 +573,23 @@ class MPMSolver(Solver):
                 self.compute_F_tmp_only(f)
         self.p2g(
             f,
-            self.sim.coupler.rigid_solver.geoms_state,
-            self.sim.coupler.rigid_solver.geoms_info,
-            self.sim.coupler.rigid_solver.links_state,
-            self.sim.coupler.rigid_solver._rigid_global_info,
+            self.sim.coupler.rigid_solver.dyn_state.geoms,
+            self.sim.coupler.rigid_solver.dyn_info.geoms,
+            self.sim.coupler.rigid_solver.dyn_state.links,
+            self.sim.coupler.rigid_solver.rigid_info,
             self.sim.coupler.rigid_solver.collider._sdf._sdf_info,
-            self.sim.coupler.rigid_solver.collider._collider_static_config,
+            self.sim.coupler.rigid_solver.collider.collider_config,
         )
 
     def substep_pre_coupling_grad(self, f):
         self.p2g.grad(
             f,
-            self.sim.coupler.rigid_solver.geoms_state,
-            self.sim.coupler.rigid_solver.geoms_info,
-            self.sim.coupler.rigid_solver.links_state,
-            self.sim.coupler.rigid_solver._rigid_global_info,
+            self.sim.coupler.rigid_solver.dyn_state.geoms,
+            self.sim.coupler.rigid_solver.dyn_info.geoms,
+            self.sim.coupler.rigid_solver.dyn_state.links,
+            self.sim.coupler.rigid_solver.rigid_info,
             self.sim.coupler.rigid_solver.collider._sdf._sdf_info,
-            self.sim.coupler.rigid_solver.collider._collider_static_config,
+            self.sim.coupler.rigid_solver.collider.collider_config,
         )
         self.svd_grad(f)
         self.compute_F_tmp.grad(f)
@@ -615,14 +597,14 @@ class MPMSolver(Solver):
     def substep_post_coupling(self, f):
         self.g2p(
             f,
-            self.sim.coupler.rigid_solver.geoms_info,
-            self.sim.coupler.rigid_solver.links_state,
-            self.sim.coupler.rigid_solver._rigid_global_info,
+            self.sim.coupler.rigid_solver.dyn_info.geoms,
+            self.sim.coupler.rigid_solver.dyn_state.links,
+            self.sim.coupler.rigid_solver.rigid_info,
         )
 
         # Apply particle constraints after g2p
         if self._constraints_initialized:
-            self.apply_particle_constraints(f, self.sim.coupler.rigid_solver.links_state)
+            self.apply_particle_constraints(f, self.sim.coupler.rigid_solver.dyn_state.links)
 
         # Eager sparse reset: zero only the cells p2g touched this substep, across all envs, then clear the global
         # dirty count so the next substep starts fresh. The grid is no longer read after g2p / constraints, so it is
@@ -648,9 +630,9 @@ class MPMSolver(Solver):
     def substep_post_coupling_grad(self, f):
         self.g2p.grad(
             f,
-            self.sim.coupler.rigid_solver.geoms_info,
-            self.sim.coupler.rigid_solver.links_state,
-            self.sim.coupler.rigid_solver._rigid_global_info,
+            self.sim.coupler.rigid_solver.dyn_info.geoms,
+            self.sim.coupler.rigid_solver.dyn_state.links,
+            self.sim.coupler.rigid_solver.rigid_info,
         )
 
     @qd.kernel
@@ -957,11 +939,7 @@ class MPMSolver(Solver):
 
     @qd.kernel
     def _kernel_set_particles_pos(
-        self,
-        f: qd.i32,
-        particles_idx: qd.types.ndarray(),
-        envs_idx: qd.types.ndarray(),
-        poss: qd.types.ndarray(),
+        self, f: qd.i32, particles_idx: qd.types.ndarray(), envs_idx: qd.types.ndarray(), poss: qd.types.ndarray()
     ):
         for i_p_, i_b_ in qd.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
             i_p = particles_idx[i_b_, i_p_]
@@ -1214,11 +1192,7 @@ class MPMSolver(Solver):
                 self.particle_constraints[i_p, i_b].link_idx = -1
 
     @qd.kernel
-    def apply_particle_constraints(
-        self,
-        f: qd.i32,
-        links_state: array_class.LinksState,
-    ):
+    def apply_particle_constraints(self, f: qd.i32, links_state: array_class.LinksState):
         for i_p, i_b in qd.ndrange(self._n_particles, self._B):
             if self.particle_constraints[i_p, i_b].is_constrained:
                 # Update target position from link pose

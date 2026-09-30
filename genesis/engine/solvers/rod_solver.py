@@ -15,7 +15,9 @@ from genesis.engine.states.solvers import RODSolverState
 from genesis.utils.geom import qd_transform_by_trans_quat
 from genesis.utils.array_class import LinksState
 
-from .base_solver import Solver
+from genesis.engine.materials import ROD
+
+from .base_solver import GravityMixin, Solver, TimeBasedMixin
 
 if TYPE_CHECKING:
     pass
@@ -121,12 +123,27 @@ def quat_rotate(q: qm.vec4, v: qm.vec3) -> qm.vec3:
 
 
 @qd.data_oriented
-class RODSolver(Solver):
+class RODSolver(GravityMixin, TimeBasedMixin, Solver):
+    material_cls = ROD.Base
+
     # ------------------------------------------------------------------------------------
     # --------------------------------- Initialization -----------------------------------
     # ------------------------------------------------------------------------------------
 
     def __init__(self, scene, sim, options):
+        # `RODOptions.dt` keeps its DLO-Lab (Genesis < 1.4) meaning: the time the rod integrates per scene step, split
+        # into `SimOptions.substeps` substeps, rather than the 1.4 meaning of a solver `dt` (the interval of one
+        # substep, from which the substep count is derived). Every DLO-Lab and easy-plug script sets it that way, and
+        # some set it apart from `SimOptions.dt`, so it never takes part in the substep-count negotiation of 1.4.
+        self._legacy_step_dt = None
+        if "dt" in options.model_fields_set:
+            self._legacy_step_dt = float(options.dt)
+            options.model_fields_set.discard("dt")
+            if abs(self._legacy_step_dt - sim.dt) > gs.EPS * sim.dt:
+                gs.logger.warning(
+                    f"RODOptions.dt={self._legacy_step_dt} differs from SimOptions.dt={sim.dt}: the rod integrates "
+                    f"{self._legacy_step_dt}s per scene step (DLO-Lab semantics)."
+                )
         super().__init__(scene, sim, options)
 
         # options
@@ -146,6 +163,9 @@ class RODSolver(Solver):
         self._two_way_attachment_force_limit = options.two_way_attachment_force_limit
         self._two_way_attachment_max_acceleration = options.two_way_attachment_max_acceleration
         self._enable_self_collision = options.enable_self_collision
+        # Rest arc length (m) around an attached vertex within which legacy rod<->rigid coupling ignores the link
+        # that vertex is attached to (see `_kernel_update_attached_link_exclusion`). 0 keeps the DLO-Lab behaviour.
+        self._attached_link_window = float(options.attached_link_collision_window)
         self._max_collision_grad_norm = 0.1
 
         # properties
@@ -534,6 +554,12 @@ class RODSolver(Solver):
             self.init_vertex_fields()
             self.init_vertex_constraints()
             self.init_edge_fields()
+            if self._attached_link_window > 0:
+                # Per vertex, up to two rigid links whose legacy coupling this vertex ignores (-1: none).
+                self.attached_link_exclusion = qd.Vector.field(
+                    2, dtype=gs.qd_int, needs_grad=False, shape=self._batch_shape(self._n_vertices)
+                )
+                self.attached_link_exclusion.fill(-1)
             self.init_internal_vertex_fields()
             self.init_ckpt()
 
@@ -542,13 +568,13 @@ class RODSolver(Solver):
 
             self.init_constraints()
 
-        # Overwrite gravity because only field is supported for now
-        if self._gravity is not None:
-            gravity = self._gravity.to_numpy()
-            self._gravity = qd.field(dtype=gs.qd_vec3, shape=(self._B,))
-            self._gravity.from_numpy(gravity)
+        # Kernels of this solver take the solver itself, so gravity has to be a field for them.
+        self._build_gravity(as_field=True)
 
-    def add_entity(self, idx, material, morph, surface, visualize_twist, name: str | None = None):
+    def add_entity(
+        self, idx, material, morph, surface, visualize_contact=False, name: str | None = None, desc=None,
+        visualize_twist=False,
+    ):
 
         # create entity
         entity = RODEntity(
@@ -571,7 +597,10 @@ class RODSolver(Solver):
 
     @property
     def is_active(self):
-        return self._n_vertices > 0
+        # Queried before build too (the simulator settles the solver rates from the active solvers first), when the
+        # vertex count is not cached yet.
+        n_vertices = self.__dict__.get("_n_vertices")
+        return (self.n_vertices if n_vertices is None else n_vertices) > 0
 
     # ------------------------------------------------------------------------------------
     # ------------------------------------ logging --------------------------------------
@@ -2191,6 +2220,58 @@ class RODSolver(Solver):
         self.vertex_constraints[i_v, envs_idx].local_pos = qd.Vector.zero(gs.qd_float, 3)
 
     @qd.kernel
+    def _kernel_update_attached_link_exclusion(self):
+        """For every vertex, collect (up to two) rigid links that a vertex of the same rod within
+        `attached_link_collision_window` of rest arc length (the vertex itself included) is attached to.
+
+        Legacy rod<->rigid coupling skips those links for this vertex: the rod next to an attachment starts inside
+        or on the surface of its own body and would otherwise push that body from inside. The result depends only
+        on the attachment table and the rest lengths, so it is recomputed every substep (attachments can change
+        between steps) and is identical in any replay of the forward pass.
+        """
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            ex0 = -1
+            ex1 = -1
+            vc = self.vertex_constraints[i_v, i_b]
+            if vc.constrained and vc.link_idx >= 0:
+                ex0 = vc.link_idx
+            i_r = self.vertices_info[i_v].rod_idx
+            first_v = self.rods_info[i_r].first_vert_idx
+            first_e = self.rods_info[i_r].first_edge_idx
+            n = self.rods_info[i_r].n_verts
+            is_loop = self.rods_info[i_r].is_loop
+            local = i_v - first_v
+            for direction in qd.static((1, -1)):
+                arc = 0.0
+                k = local
+                for _ in range(n - 1):
+                    k_next = k + direction
+                    if not is_loop and (k_next < 0 or k_next >= n):
+                        break
+                    if k_next < 0:
+                        k_next += n
+                    if k_next >= n:
+                        k_next -= n
+                    e_local = k if direction == 1 else k_next
+                    arc += self.edges_info[first_e + e_local].length_rest
+                    if arc > qd.static(self._attached_link_window):
+                        break
+                    k = k_next
+                    other = self.vertex_constraints[first_v + k, i_b]
+                    if other.constrained and other.link_idx >= 0 and other.link_idx != ex0 and other.link_idx != ex1:
+                        if ex0 < 0:
+                            ex0 = other.link_idx
+                        elif ex1 < 0:
+                            ex1 = other.link_idx
+            self.attached_link_exclusion[i_v, i_b][0] = ex0
+            self.attached_link_exclusion[i_v, i_b][1] = ex1
+
+    @qd.func
+    def _func_attached_link_excluded(self, i_v, i_b, link_idx):
+        ex = self.attached_link_exclusion[i_v, i_b]
+        return link_idx >= 0 and (ex[0] == link_idx or ex[1] == link_idx)
+
+    @qd.kernel
     def _kernel_update_attached_verts(
         self,
         links_state: LinksState,
@@ -2267,7 +2348,9 @@ class RODSolver(Solver):
         for i_v, i_b in qd.ndrange(self.n_vertices, self._B):
             for j in qd.static(range(3)):
                 pos_j = qd.cast(self.vertices[f, i_v, i_b].vert[j], qd.f32)
-                self.vertices_render[i_v, i_b][j] = pos_j + self.envs_offset[i_b][j]
+                # The rasterizer places each env-specific node at its env offset itself (see JITRenderer), so the
+                # positions are left in the simulation frame here.
+                self.vertices_render[i_v, i_b][j] = pos_j
 
     @qd.kernel
     def _kernel_set_state(
@@ -2405,6 +2488,14 @@ class RODSolver(Solver):
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------
     # ------------------------------------------------------------------------------------
+
+    @property
+    def substep_dt(self):
+        """Interval the rod integrates over per substep: `RODOptions.dt / substeps` when a rod dt was given
+        (DLO-Lab semantics), the scene substep interval otherwise."""
+        if self._legacy_step_dt is not None:
+            return self._legacy_step_dt / self._substeps
+        return self._substep_dt
 
     @property
     def floor_height(self):
@@ -2843,7 +2934,7 @@ class RODSolver(Solver):
 
                 w_sum_sq_inv_mass = qm.dot(w * w, im)
                 if w_sum_sq_inv_mass > EPS:
-                    normal_vel_mag = penetration / self._substep_dt
+                    normal_vel_mag = penetration / self.substep_dt
 
                     mu_s = (self.vertices_param[idx_a1, i_b].mu_s + self.vertices_param[idx_a2, i_b].mu_s + self.vertices_param[idx_b1, i_b].mu_s + self.vertices_param[idx_b2, i_b].mu_s) * 0.25
                     mu_k = (self.vertices_param[idx_a1, i_b].mu_k + self.vertices_param[idx_a2, i_b].mu_k + self.vertices_param[idx_b1, i_b].mu_k + self.vertices_param[idx_b2, i_b].mu_k) * 0.25
@@ -2926,7 +3017,7 @@ class RODSolver(Solver):
                     v_tangent_norm = qm.length(v_tangent)
 
                     penetration = self.rr_constraints[f, i_p, i_b].penetration
-                    normal_vel_mag = penetration / self._substep_dt
+                    normal_vel_mag = penetration / self.substep_dt
                     mu_s = (self.vertices_param[idx_a1, i_b].mu_s + self.vertices_param[idx_a2, i_b].mu_s + self.vertices_param[idx_b1, i_b].mu_s + self.vertices_param[idx_b2, i_b].mu_s) * 0.25
                     mu_k = (self.vertices_param[idx_a1, i_b].mu_k + self.vertices_param[idx_a2, i_b].mu_k + self.vertices_param[idx_b1, i_b].mu_k + self.vertices_param[idx_b2, i_b].mu_k) * 0.25
 
@@ -2944,7 +3035,7 @@ class RODSolver(Solver):
                         g_v_tangent += (g_n_t - n_t.dot(g_n_t) * n_t) * inv_norm
                         g_normal_vel_mag += g_F_k * mu_k
                     
-                    self.rr_constraints.grad[f, i_p, i_b].penetration += g_normal_vel_mag / self._substep_dt
+                    self.rr_constraints.grad[f, i_p, i_b].penetration += g_normal_vel_mag / self.substep_dt
                     
                     g_v_rel = g_v_tangent - normal.dot(g_v_tangent) * normal
                     
