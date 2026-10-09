@@ -423,10 +423,40 @@ class Simulator(RBC):
                 solver.truncate_adjoint()
 
     def substep(self, f):
+        if self.rod_solver.is_active and self.rod_solver.substeps_per_sim_substep > 1:
+            self._substep_multirate_rod(f)
+            return
         self._coupler.preprocess(f)
         self.substep_pre_coupling(f)
         self._coupler.couple(f)
         self.substep_post_coupling(f)
+
+    def _substep_multirate_rod(self, f):
+        """One scene substep in which the rod runs `RODOptions.substeps_per_sim_substep` substeps (forward only).
+
+        The other solvers advance once. The rod substeps in place on frame `f` (each inner substep after the first
+        restarts from the frame the previous one produced), so frame storage and state readout are unchanged.
+        Rod<->rigid coupling runs every rod substep against the rigid state of this scene substep; the other
+        couplings run once.
+        """
+        rod = self.rod_solver
+        if not hasattr(self._coupler, "couple_rod"):
+            gs.raise_exception("RODOptions.substeps_per_sim_substep > 1 requires the LegacyCoupler.")
+        others = [solver for solver in self._active_solvers if solver is not rod]
+        self._coupler.preprocess(f)
+        for solver in others:
+            solver.substep_pre_coupling(f)
+        for k in range(rod.substeps_per_sim_substep):
+            if k > 0:
+                rod.restart_substep(f)
+            rod.substep_pre_coupling(f)
+            if k == 0:
+                self._coupler.couple(f)
+            else:
+                self._coupler.couple_rod(f, inner_substep=k)
+            rod.substep_post_coupling(f)
+        for solver in others:
+            solver.substep_post_coupling(f)
 
     def sub_step_grad(self, f):
         self.substep_post_coupling_grad(f)

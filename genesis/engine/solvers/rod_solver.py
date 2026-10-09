@@ -145,6 +145,10 @@ class RODSolver(GravityMixin, TimeBasedMixin, Solver):
                     f"{self._legacy_step_dt}s per scene step (DLO-Lab semantics)."
                 )
         super().__init__(scene, sim, options)
+        # Rod substeps per scene substep (`Simulator.substep`); the rod integrates over 1/N of a scene substep.
+        self._substeps_per_sim_substep = options.substeps_per_sim_substep
+        if self._substeps_per_sim_substep > 1 and sim.requires_grad:
+            gs.raise_exception("RODOptions.substeps_per_sim_substep > 1 supports forward simulation only.")
 
         # options
         self._floor_height = options.floor_height
@@ -1085,6 +1089,17 @@ class RODSolver(GravityMixin, TimeBasedMixin, Solver):
                         self.inextensibility_forward.grad(self, f, i)
             self.update_frame_thetas.grad(f)
             self.update_centerline_positions.grad(f)
+
+    def restart_substep(self, f):
+        """Restart substep `f` from the state the previous rod substep left in frame `f + 1`.
+
+        Used for the extra rod substeps run inside one scene substep (`substeps_per_sim_substep` > 1). Per-substep
+        contact marks on frame `f` are cleared, as they are at the start of every scene step.
+        """
+        self.copy_frame(f + 1, f)
+        self._kernel_clear_kinematic_states(f)
+        if self._enable_self_collision and self._n_valid_edge_pairs > 0:
+            self._kernel_clear_contact_states(f)
 
     @qd.kernel
     def copy_frame(self, source: qd.i32, target: qd.i32):
@@ -2491,11 +2506,16 @@ class RODSolver(GravityMixin, TimeBasedMixin, Solver):
 
     @property
     def substep_dt(self):
-        """Interval the rod integrates over per substep: `RODOptions.dt / substeps` when a rod dt was given
-        (DLO-Lab semantics), the scene substep interval otherwise."""
+        """Interval the rod integrates over per rod substep: `RODOptions.dt / substeps` when a rod dt was given
+        (DLO-Lab semantics), the scene substep interval otherwise, divided by `substeps_per_sim_substep`."""
         if self._legacy_step_dt is not None:
-            return self._legacy_step_dt / self._substeps
-        return self._substep_dt
+            return self._legacy_step_dt / (self._substeps * self._substeps_per_sim_substep)
+        return self._substep_dt / self._substeps_per_sim_substep
+
+    @property
+    def substeps_per_sim_substep(self):
+        """Rod substeps run inside each scene substep (`RODOptions.substeps_per_sim_substep`)."""
+        return self._substeps_per_sim_substep
 
     @property
     def floor_height(self):

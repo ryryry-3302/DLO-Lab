@@ -1049,6 +1049,12 @@ class RODOptions(GravityMixin, TimeBasedMixin):
         connector boot), and would otherwise push that body from inside. Farther along the rod, contact
         with the attached body is kept. 0 disables the exclusion (the DLO-Lab behaviour); any value longer than
         the rod (e.g. 1e3) excludes the whole rod<->attached-link pair. Defaults to 0.05.
+    substeps_per_sim_substep : int, optional
+        Rod substeps run inside each scene substep (forward simulation only). The rod integrates over
+        `substep_dt / substeps_per_sim_substep` while the other solvers keep the scene substep, so a stiff rod can
+        get the substeps its explicit elastic forces need without forcing them on the rigid solver. Rod<->rigid
+        coupling runs at the rod rate against the rigid state of the current scene substep; the rigid side receives
+        the mean coupling force over the inner substeps. Defaults to 1 (rod and scene substeps coincide).
     """
 
     damping: NonNegativeFloat = 0.0
@@ -1067,3 +1073,4 @@ class RODOptions(GravityMixin, TimeBasedMixin):
     two_way_attachment_max_acceleration: PositiveFloat = 10.0
     enable_self_collision: StrictBool = True
     attached_link_collision_window: NonNegativeFloat = 0.05
+    substeps_per_sim_substep: PositiveInt = 1
