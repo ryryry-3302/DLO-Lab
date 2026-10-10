@@ -366,6 +366,12 @@ class RODEntity(Entity):
         verts_np = tensor_to_array(self.init_positions, dtype=gs.np_float)
         rest_verts_np = tensor_to_array(self.rest_positions, dtype=gs.np_float)
         edges_np = tensor_to_array(self.edges, dtype=gs.np_float)
+        # Rest edges (and so rest curvature and rest material frames) from the rest positions, so
+        # rest_state="straight" takes effect; for "default" they equal the initial edges.
+        rest_edges_np = np.roll(rest_verts_np, -1, axis=0) - rest_verts_np
+        if not self.is_loop:
+            rest_edges_np = rest_edges_np[:-1]
+        rest_edges_np = np.ascontiguousarray(rest_edges_np, dtype=gs.np_float)
 
         self._solver._kernel_add_rods(
             rod_idx=self._rod_idx,
@@ -394,7 +400,7 @@ class RODEntity(Entity):
             kinetic_friction=self.material.kinetic_friction,
             restitution=self.material.restitution,
             verts_rest=rest_verts_np,
-            edges_rest=edges_np,
+            edges_rest=rest_edges_np,
         )
 
         self._solver._kernel_finalize_states(

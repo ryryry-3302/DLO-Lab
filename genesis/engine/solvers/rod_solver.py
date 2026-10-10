@@ -1687,7 +1687,9 @@ class RODSolver(GravityMixin, TimeBasedMixin, Solver):
             # finalize rest curvature binormal
 
             rest_kbs = curvature_binormal(self.edges_info[e_s].d3_rest, self.edges_info[e_e].d3_rest)
-            self.internal_vertices[f, i_iv, i_b].kappa_rest = qd.Vector([
+            # Global internal-vertex index: with several rods, a local index wrote every rod's rest
+            # curvature into the first rod's internal vertices.
+            self.internal_vertices[f, i_global, i_b].kappa_rest = qd.Vector([
                   0.5 * qm.dot(rest_kbs, self.edges_info[e_s].d2_rest + self.edges_info[e_e].d2_rest),
                 - 0.5 * qm.dot(rest_kbs, self.edges_info[e_s].d1_rest + self.edges_info[e_e].d1_rest),
             ])
