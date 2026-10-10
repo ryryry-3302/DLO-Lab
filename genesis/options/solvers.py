@@ -1055,6 +1055,12 @@ class RODOptions(GravityMixin, TimeBasedMixin):
         get the substeps its explicit elastic forces need without forcing them on the rigid solver. Rod<->rigid
         coupling runs at the rod rate against the rigid state of the current scene substep; the rigid side receives
         the mean coupling force over the inner substeps. Defaults to 1 (rod and scene substeps coincide).
+    velocity_from_correction : bool, optional
+        After the PBD projection, set a vertex velocity to its predicted velocity plus the projection correction,
+        `v + (x_projected - x_predicted) / dt`, instead of `(x_projected - x_old) / dt` (forward simulation only).
+        Both are equal in exact arithmetic. In float32 the second loses any velocity whose per-substep displacement
+        is below half the position resolution (about 6e-8 m at |x| ~ 1 m): a rod at rest with many substeps (a stiff
+        rod, small dt) then never starts moving, and slow motion is quantised. Defaults to False (DLO-Lab behaviour).
     """
 
     damping: NonNegativeFloat = 0.0
@@ -1074,3 +1080,4 @@ class RODOptions(GravityMixin, TimeBasedMixin):
     enable_self_collision: StrictBool = True
     attached_link_collision_window: NonNegativeFloat = 0.05
     substeps_per_sim_substep: PositiveInt = 1
+    velocity_from_correction: StrictBool = False

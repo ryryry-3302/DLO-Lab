@@ -149,6 +149,10 @@ class RODSolver(GravityMixin, TimeBasedMixin, Solver):
         self._substeps_per_sim_substep = options.substeps_per_sim_substep
         if self._substeps_per_sim_substep > 1 and sim.requires_grad:
             gs.raise_exception("RODOptions.substeps_per_sim_substep > 1 supports forward simulation only.")
+        # Post-projection velocity from the predicted velocity plus the projection correction (see RODOptions).
+        self._velocity_from_correction = options.velocity_from_correction
+        if self._velocity_from_correction and sim.requires_grad:
+            gs.raise_exception("RODOptions.velocity_from_correction supports forward simulation only.")
 
         # options
         self._floor_height = options.floor_height
@@ -345,6 +349,12 @@ class RODSolver(GravityMixin, TimeBasedMixin, Solver):
             needs_grad=True,
             layout=qd.Layout.SOA
         )
+
+        if self._velocity_from_correction:
+            # Positions after the explicit update, before the PBD projection (velocity_from_correction).
+            self.vertices_pred = qd.Vector.field(
+                3, dtype=gs.qd_float, shape=self._batch_shape(self._n_vertices), needs_grad=False
+            )
 
         self.vertices_force = struct_vertex_force.field(
             shape=self._batch_shape(self._n_vertices),
@@ -733,6 +743,21 @@ class RODSolver(GravityMixin, TimeBasedMixin, Solver):
             self.internal_vertices[f + 1, i_iv, i_b].twist = self.edges[f + 1, e_e, i_b].theta - self.edges[f + 1, e_s, i_b].theta + twist_ref
 
     @qd.kernel
+    def store_predicted_positions(self, f: qd.i32):
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            self.vertices_pred[i_v, i_b] = self.vertices[f + 1, i_v, i_b].vert
+
+    @qd.kernel
+    def update_velocities_from_correction(self, f: qd.i32):
+        # v_pred + (x_proj - x_pred) / dt: equal to (x_proj - x_old) / dt in exact arithmetic, but keeps velocity
+        # that a float32 position update rounded away (RODOptions.velocity_from_correction).
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            if (not self.vertices_ng[f, i_v, i_b].fixed and not self.vertex_constraints[i_v, i_b].constrained):
+                self.vertices[f + 1, i_v, i_b].vel += (
+                    self.vertices[f + 1, i_v, i_b].vert - self.vertices_pred[i_v, i_b]
+                ) / self.substep_dt
+
+    @qd.kernel
     def update_velocities_after_projection(self, f: qd.i32):   # Differential
         for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
             if (not self.vertices_ng[f, i_v, i_b].fixed and not self.vertex_constraints[i_v, i_b].constrained):
@@ -1060,6 +1085,8 @@ class RODSolver(GravityMixin, TimeBasedMixin, Solver):
             if self._constraints_initialized:
                 self.apply_hard_constraints(f)
             self.update_centerline_positions(f)
+            if self._velocity_from_correction:
+                self.store_predicted_positions(f)
             self.update_frame_thetas(f)
             for i in qd.static(range(self._n_pbd_iters)):
                 self.inextensibility_forward(f, i)
@@ -1067,7 +1094,10 @@ class RODSolver(GravityMixin, TimeBasedMixin, Solver):
                     self.collision_forward(f, i)
             self.update_centerline_edges(f)
             self.update_material_states(f)
-            self.update_velocities_after_projection(f)
+            if self._velocity_from_correction:
+                self.update_velocities_from_correction(f)
+            else:
+                self.update_velocities_after_projection(f)
             self.friction_forward(f)
             self.transfer_vertex_states(f)   # f -> f+1
 
