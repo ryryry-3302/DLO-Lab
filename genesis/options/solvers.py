@@ -1061,6 +1061,14 @@ class RODOptions(GravityMixin, TimeBasedMixin):
         Both are equal in exact arithmetic. In float32 the second loses any velocity whose per-substep displacement
         is below half the position resolution (about 6e-8 m at |x| ~ 1 m): a rod at rest with many substeps (a stiff
         rod, small dt) then never starts moving, and slow motion is quantised. Defaults to False (DLO-Lab behaviour).
+    pbd_in_displacements : bool, optional
+        Integrate and project each substep's displacement as its own quantity instead of updating absolute positions
+        (forward simulation only; implies the velocity of `velocity_from_correction`). The inextensibility
+        constraints are evaluated on `x + d` with the edge vector `(x_e - x_s) + (d_e - d_s)`, so a displacement far
+        below the float32 resolution of `x` (about 1.2e-7 m at |x| ~ 1 m) still enters the projection; the
+        position is updated once per substep and its rounding remainder carries into the next substep. Without it,
+        a stiff float32 rod with many substeps settles at a visibly wrong equilibrium. Not supported with
+        `enable_self_collision`. Defaults to False.
     """
 
     damping: NonNegativeFloat = 0.0
@@ -1081,3 +1089,4 @@ class RODOptions(GravityMixin, TimeBasedMixin):
     attached_link_collision_window: NonNegativeFloat = 0.05
     substeps_per_sim_substep: PositiveInt = 1
     velocity_from_correction: StrictBool = False
+    pbd_in_displacements: StrictBool = False

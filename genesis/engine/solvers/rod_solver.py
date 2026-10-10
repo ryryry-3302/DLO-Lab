@@ -153,6 +153,12 @@ class RODSolver(GravityMixin, TimeBasedMixin, Solver):
         self._velocity_from_correction = options.velocity_from_correction
         if self._velocity_from_correction and sim.requires_grad:
             gs.raise_exception("RODOptions.velocity_from_correction supports forward simulation only.")
+        # Integrate and project per-substep displacements instead of absolute positions (see RODOptions).
+        self._pbd_in_displacements = options.pbd_in_displacements
+        if self._pbd_in_displacements and sim.requires_grad:
+            gs.raise_exception("RODOptions.pbd_in_displacements supports forward simulation only.")
+        if self._pbd_in_displacements and options.enable_self_collision:
+            gs.raise_exception("RODOptions.pbd_in_displacements does not support enable_self_collision.")
 
         # options
         self._floor_height = options.floor_height
@@ -353,6 +359,14 @@ class RODSolver(GravityMixin, TimeBasedMixin, Solver):
         if self._velocity_from_correction:
             # Positions after the explicit update, before the PBD projection (velocity_from_correction).
             self.vertices_pred = qd.Vector.field(
+                3, dtype=gs.qd_float, shape=self._batch_shape(self._n_vertices), needs_grad=False
+            )
+        if self._pbd_in_displacements:
+            # This substep's displacement, and the rounding remainder of the last position update.
+            self.vertices_disp = qd.Vector.field(
+                3, dtype=gs.qd_float, shape=self._batch_shape(self._n_vertices), needs_grad=False
+            )
+            self.vertices_resid = qd.Vector.field(
                 3, dtype=gs.qd_float, shape=self._batch_shape(self._n_vertices), needs_grad=False
             )
 
@@ -743,6 +757,57 @@ class RODSolver(GravityMixin, TimeBasedMixin, Solver):
             self.internal_vertices[f + 1, i_iv, i_b].twist = self.edges[f + 1, e_e, i_b].theta - self.edges[f + 1, e_s, i_b].theta + twist_ref
 
     @qd.kernel
+    def init_displacements(self, f: qd.i32):
+        # d = v dt + remainder; positions stay at frame f until commit_displacements (pbd_in_displacements).
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            self.vertices_disp[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
+            if (
+                not self.vertices_ng[f, i_v, i_b].fixed and
+                not self.vertex_constraints[i_v, i_b].constrained
+            ):
+                self.vertices_disp[i_v, i_b] = (
+                    self.vertices[f + 1, i_v, i_b].vel * self.substep_dt + self.vertices_resid[i_v, i_b]
+                )
+
+    @qd.kernel
+    def apply_inextensibility_on_displacements(self, f: qd.i32):
+        # _kernel_apply_inextensibility_constraints on x + d, with the edge vector formed from the (small) position
+        # and displacement differences separately so sub-ulp displacements are not lost.
+        for i_e, i_b in qd.ndrange(self._n_edges, self._B):
+            v_s, v_e = self.get_edge_vertices(i_e)
+            rod_id = self.vertices_info[v_s].rod_idx
+            if self.rods_param[rod_id, i_b].use_inextensible:
+                inv_mass_s = self._func_get_inverse_mass(f, v_s, i_b)
+                inv_mass_e = self._func_get_inverse_mass(f, v_e, i_b)
+                inv_mass_sum = inv_mass_s + inv_mass_e
+                if inv_mass_sum > EPS:
+                    edge_vec = (self.vertices[f + 1, v_e, i_b].vert - self.vertices[f + 1, v_s, i_b].vert) + (
+                        self.vertices_disp[v_e, i_b] - self.vertices_disp[v_s, i_b]
+                    )
+                    dist = qm.length(edge_vec)
+                    if dist > EPS:
+                        normal = edge_vec / dist
+                        lambda_ = (dist - self.edges_info[i_e].length_rest) / inv_mass_sum
+                        self.vertices_disp[v_s, i_b] += lambda_ * inv_mass_s * normal
+                        self.vertices_disp[v_e, i_b] += -lambda_ * inv_mass_e * normal
+
+    @qd.kernel
+    def commit_displacements(self, f: qd.i32):
+        # x += d once; v = (d - previous remainder) / dt = predicted velocity + projection correction / dt; keep the
+        # new rounding remainder (x_new - x_old is exact in floating point for nearby values).
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            if (
+                not self.vertices_ng[f, i_v, i_b].fixed and
+                not self.vertex_constraints[i_v, i_b].constrained
+            ):
+                old = self.vertices[f + 1, i_v, i_b].vert
+                disp = self.vertices_disp[i_v, i_b]
+                new = old + disp
+                self.vertices[f + 1, i_v, i_b].vel = (disp - self.vertices_resid[i_v, i_b]) / self.substep_dt
+                self.vertices_resid[i_v, i_b] = disp - (new - old)
+                self.vertices[f + 1, i_v, i_b].vert = new
+
+    @qd.kernel
     def store_predicted_positions(self, f: qd.i32):
         for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
             self.vertices_pred[i_v, i_b] = self.vertices[f + 1, i_v, i_b].vert
@@ -1084,6 +1149,9 @@ class RODSolver(GravityMixin, TimeBasedMixin, Solver):
         if self.is_active:
             if self._constraints_initialized:
                 self.apply_hard_constraints(f)
+            if self._pbd_in_displacements:
+                self._substep_post_coupling_displacements(f)
+                return
             self.update_centerline_positions(f)
             if self._velocity_from_correction:
                 self.store_predicted_positions(f)
@@ -1103,6 +1171,21 @@ class RODSolver(GravityMixin, TimeBasedMixin, Solver):
 
             if self._constraints_initialized:
                 self.apply_hard_constraints(f)
+
+    def _substep_post_coupling_displacements(self, f):
+        """`substep_post_coupling` with the PBD projection on per-substep displacements (pbd_in_displacements)."""
+        self.init_displacements(f)
+        self.update_frame_thetas(f)
+        if self._any_inextensible:
+            for i in range(self._n_pbd_iters):
+                self.apply_inextensibility_on_displacements(f)
+        self.commit_displacements(f)
+        self.update_centerline_edges(f)
+        self.update_material_states(f)
+        self.friction_forward(f)
+        self.transfer_vertex_states(f)   # f -> f+1
+        if self._constraints_initialized:
+            self.apply_hard_constraints(f)
 
     def substep_post_coupling_grad(self, f):
         if self.is_active:
